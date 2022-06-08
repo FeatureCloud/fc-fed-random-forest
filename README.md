@@ -1,4 +1,12 @@
-# FeatureCloud App Template
+# FeatureCloud App Dice Template
+The app-dice template contains four states as it is depicted in the diagram:
+![states](state-diagram.png)
+
+1. Each participant throws a die (random number between 1 and 6)
+2. They then send their thrown number to the coordinator
+3. The coordinator aggregates all values (calculates the sum)
+4. The coordinator broadcasts the sum to all participants
+5. The participants print the received sum to the log messages
 
 For registering and testing your apps or using other apps, please visit
 [FeatureCloud.ai](https://featurecloud.ai/). And for more information about FeatureCloud architecture,
