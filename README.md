@@ -78,20 +78,20 @@ implementation of states or importing them. Moreover, `main` should import `bott
 ```angular2html
 from bottle import Bottle
 
-from api.http_ctrl import api_server
-from api.http_web import web_server
+from FeatureCloud.app.api.http_ctrl import api_server
+from FeatureCloud.app.api.http_web import web_server
 
-import apps.examples.dice
+from FeatureCloud.app.engine.app import app
 
-from engine.app import app
+import states
 
 server = Bottle()
 ```
-Here we imported `dice` app from our [`apps`](apps/README.md) package which because of putting 
-[`app_state`](engine/README.md#registering-states-to-the-app-app_state) on top of state classes, 
-merely importing the states register them into the [`app` instance](engine/README.md#app-instance).     
+Here we imported implemented states for `dice` app from [`states`](states.py) package which because of putting 
+[`app_state`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine#registering-states-to-the-app-app_state) on top of state classes, 
+merely importing the states register them into the [`app` instance](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine#app-instance).     
 
-For running the app, inside a docker container, [`app.register()`](engine/README.md#registering-all-transitions-appregister)
+For running the app, inside a docker container, [`app.register()`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app/engine#registering-all-transitions-appregister)
 should be called to register and verify all transitions; next, api and servers should mount at corresponding paths; and finally
 server is ready to run the app.
 
@@ -121,7 +121,7 @@ And the rest should be all other app required libraries.
 
 ##### config.yml
 Each app may need some hyper-parameters or arguments that should be provided by the end-users. Such data should be included
-in [`config.yml`](apps/README.md#config-file) which should be read and interpreted by the app. 
+in [`config.yml`](https://github.com/FeatureCloud/FeatureCloud/tree/master/FeatureCloud/app#config-file-configyml) which should be read and interpreted by the app. 
 
 ### References
 <a id="1">[1]</a> 
