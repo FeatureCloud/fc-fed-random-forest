@@ -60,8 +60,7 @@ developers should provide following files.
 For dockerizing apps, regardless of their applications, there should be some specific files:
 
 1. [Dockerfile](Dockerfile)
-2. [build.sh](build.sh)
-3. [server-config](server_config)
+2. [server-config](server_config)
    - [docker-entrypoint.sh](server_config/docker-entrypoint.sh)
    - [nginx](server_config/nginx)
    - [supervisord.conf](server_config/supervisord.conf)
