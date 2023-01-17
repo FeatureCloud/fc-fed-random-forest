@@ -1,0 +1,19 @@
+fc-rand-forest:
+  input:
+    - train: 'train.csv'
+    - test: 'test.csv'
+  output:
+    - pred: 'pred.csv'
+    - test: 'test.csv'
+  format:
+    - sep: ','
+    - label_col: 'target'
+  split:
+    - mode: 'file'
+    - dir: .
+  n_estimators: 2
+  max_depth: 2
+  max_features: None
+  bootstrap: True
+  mode: 'classification'
+  random_state: 42

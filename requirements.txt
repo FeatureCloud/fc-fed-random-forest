@@ -1,1 +1,7 @@
 featurecloud
+scikit-learn
+bios
+pandas
+scipy
+numpy
+skops
