@@ -2,3 +2,4 @@
 venv
 *.pyc
 .DS_Store
+/sample_data/microbiome/

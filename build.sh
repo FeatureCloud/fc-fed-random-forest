@@ -1,0 +1,1 @@
+featurecloud app build . fc-rand-forest

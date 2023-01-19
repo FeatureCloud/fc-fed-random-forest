@@ -26,13 +26,14 @@ def read_config():
     split_dir = config_split[1]['dir']
 
     n_estimators = int(config['n_estimators'])
-    max_depth = int(config['max_depth'])
+    max_depth = config['max_depth']
     max_features = config['max_features']
+    max_samples = config['max_samples']
     bootstrap = bool(config['bootstrap'])
     prediction_mode = config['mode']
     random_state = config['random_state']
 
-    return train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, n_estimators, max_depth, max_features, bootstrap, prediction_mode, random_state
+    return train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, n_estimators, max_depth, max_features, max_samples, bootstrap, prediction_mode, random_state
 
 
 def read_files(train: str, test_input: str, label_col: str):
