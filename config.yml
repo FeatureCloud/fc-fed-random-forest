@@ -12,9 +12,12 @@ fc-rand-forest:
     - mode: 'file'
     - dir: .
   n_estimators: 100
-  max_depth: 5
+  max_depth: 10
+  min_samples_split: 2
+  min_samples_leaf: 1
   max_features: 'sqrt'
-  max_samples: 0.5
+  max_samples: 0.75
   bootstrap: True
-  mode: 'classification'
   random_state: 42
+  mode: 'classification'
+  n_bins: 10
