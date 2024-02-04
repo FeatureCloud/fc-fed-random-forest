@@ -102,8 +102,7 @@ class LocalBinningState(AppState):
     """
 
     def register(self):
-        self.register_transition('gather_binning', Role.COORDINATOR)
-        self.register_transition('wait_binning', Role.PARTICIPANT)
+        self.register_transition('aggregate_binning', Role.BOTH)
         
     def run(self) -> str or None:
         
@@ -128,16 +127,14 @@ class LocalBinningState(AppState):
             max_array = np.max(X[split][:, bucket_idcs], axis=0)
             send_data_bucket.append(np.array([min_array, max_array]))
         
-        self.send_data_to_coordinator([local_matrix_list, send_data_bucket], use_smpc=False)
+        self.send_data_to_coordinator([local_matrix_list, send_data_bucket])
 
-        if self.is_coordinator:
-            return 'gather_binning'
-        else:
-            return 'wait_binning'
+        return 'aggregate_binning'
 
 
-@app_state('gather_binning', Role.COORDINATOR)
-class GatherBinningState(AppState):
+
+@app_state('aggregate_binning', Role.BOTH)
+class AggregateBinningState(AppState):
 
     """
     Aggregate data for federated z-score normalization and calculate global minima and maxima
@@ -145,50 +142,40 @@ class GatherBinningState(AppState):
     """
 
     def register(self):
-        self.register_transition('wait_binning', Role.COORDINATOR)
-        
-    def run(self) -> str or None:
-        gathered_data = self.gather_data()
-        
-        broadcast_data_quantile = []
-        local_matrix_list = [gathered_data[i][0] for i in range(len(gathered_data))]
-        for split in range(len(self.load('X'))):
-            data = [d[split] for d in local_matrix_list]
-            global_matrix = np.sum(data, axis=0)
-            mean_square = global_matrix[:, 1] / global_matrix[:, 0]
-            mean = global_matrix[:, 2] / global_matrix[:, 0]
-            stddev = np.sqrt(mean_square - np.square(mean))
-            broadcast_data_quantile.append(np.array([mean, stddev]))
-
-        split_points_bucket = []
-        n_bins = self.load('n_bins')
-        data_bucket = [gathered_data[i][1] for i in range(len(gathered_data))]
-
-        for split in range(len(self.load('X'))):
-            data = [d[split] for d in data_bucket]
-            min_max_values = np.array(data)
-            min_values = np.minimum.reduce(min_max_values[:, 0])
-            max_values = np.maximum.reduce(min_max_values[:, 1])
-            bins = [np.linspace(min_values[i], max_values[i], \
-                                    n_bins + 1) for i in range(len(min_values))]
-            split_points_bucket.append([b[:-1] for b in bins])
-
-        self.broadcast_data([broadcast_data_quantile, split_points_bucket], send_to_self=True)
-
-        return 'wait_binning'
-
-
-@app_state('wait_binning', Role.BOTH)
-class WaitBinningState(AppState):
-    """
-    Bucket Binning.
-    """
-
-    def register(self):
         self.register_transition('global_binning', Role.BOTH)
-           
+        
     def run(self) -> str or None:
-        data = self.await_data()
+        if self.is_coordinator:
+            gathered_data = self.gather_data()
+
+            broadcast_data_quantile = []
+            local_matrix_list = [gathered_data[i][0] for i in range(len(gathered_data))]
+            for split in range(len(self.load('X'))):
+                data = [d[split] for d in local_matrix_list]
+                global_matrix = np.sum(data, axis=0)
+                mean_square = global_matrix[:, 1] / global_matrix[:, 0]
+                mean = global_matrix[:, 2] / global_matrix[:, 0]
+                stddev = np.sqrt(mean_square - np.square(mean))
+                broadcast_data_quantile.append(np.array([mean, stddev]))
+
+            split_points_bucket = []
+            n_bins = self.load('n_bins')
+            data_bucket = [gathered_data[i][1] for i in range(len(gathered_data))]
+
+            for split in range(len(self.load('X'))):
+                data = [d[split] for d in data_bucket]
+                min_max_values = np.array(data)
+                min_values = np.minimum.reduce(min_max_values[:, 0])
+                max_values = np.maximum.reduce(min_max_values[:, 1])
+                bins = [np.linspace(min_values[i], max_values[i], \
+                                        n_bins + 1) for i in range(len(min_values))]
+                split_points_bucket.append([b[:-1] for b in bins])
+
+            data = [broadcast_data_quantile, split_points_bucket]
+            self.broadcast_data(data, send_to_self=False)
+
+        else:
+            data = self.await_data()
 
         global_mean = [d[0] for d in data[0]]
         global_stddev = [d[1] for d in data[0]]
@@ -422,8 +409,7 @@ class LocalSplitState(AppState):
     """
 
     def register(self):
-        self.register_transition('aggregate_splits', Role.COORDINATOR)
-        self.register_transition('obtain_splits', Role.PARTICIPANT)
+        self.register_transition('aggregate_splits', Role.BOTH)
 
     def run(self) -> str or None:
         rf_models = self.load('rf_models')
@@ -454,76 +440,62 @@ class LocalSplitState(AppState):
                         tmp_split.append(tmp_dt)
             if len(tmp_split) > 0:
                 local_splits.append(tmp_split)
-        self.send_data_to_coordinator(local_splits, use_smpc=False)
+        self.send_data_to_coordinator(local_splits)
 
-        if self.is_coordinator:
-            return 'aggregate_splits'
-
-        return 'obtain_splits'
+        return 'aggregate_splits'
 
 
-@app_state('aggregate_splits', Role.COORDINATOR)
+@app_state('aggregate_splits', Role.BOTH)
 class AggregateSplitState(AppState):
     """
     The coordinator receives the local split scores from each client, aggreagtes them and 
     chooses the feature-threshold combination with the minimal score value for splitting.
-    """
-
-    def register(self):
-       self.register_transition('obtain_splits', Role.COORDINATOR)
-
-    def run(self) -> str or None:
-        rf_models = self.load('rf_models')
-        data = self.gather_data()
-        global_splits = []
-        counter_split = 0
-  
-        for split in range(len(self.load('X_hist'))):
-            rf_model = rf_models[split]
-            tmp_split = []
-            if not rf_model.finished:
-                counter_dt = 0
-                for decision_tree in rf_model.decision_trees:
-                    tmp_dt = []
-                    if not decision_tree.finished:
-                        nodes = decision_tree.cur_depth_nodes
-                        for node in range(len(nodes)):
-                            split_scores = [np.array(data[i][counter_split][counter_dt][node]) \
-                                      for i in range(len(data))]
-                            sum_split_score = np.sum(split_scores, axis=0)
-                            best_split = [np.unravel_index(np.argmin(sum_split_score), \
-                                         sum_split_score.shape), np.min(sum_split_score)]
-                            tmp_dt.append(best_split)
-                        counter_dt = counter_dt + 1
-                        tmp_split.append(tmp_dt)
-                counter_split = counter_split + 1
-                if len(tmp_split) > 0:
-                    global_splits.append(tmp_split)
-        self.broadcast_data(global_splits, send_to_self=True)
-        
-        return 'obtain_splits'
-
-
-@app_state('obtain_splits', Role.BOTH)
-class ObtainSplitState(AppState):
-
-    """
     The participants receive the best feature-threshold combination for splitting the data
     and they split the data based on the received feature and threshold.
     """
 
     def register(self):
-        self.register_transition('local_stopping_criteria', Role.BOTH)
+       self.register_transition('local_stopping_criteria', Role.BOTH)
 
     def run(self) -> str or None:
+        if self.is_coordinator:
+            rf_models = self.load('rf_models')
+            data = self.gather_data()
+            global_splits = []
+            counter_split = 0
+  
+            for split in range(len(self.load('X_hist'))):
+                rf_model = rf_models[split]
+                tmp_split = []
+                if not rf_model.finished:
+                    counter_dt = 0
+                    for decision_tree in rf_model.decision_trees:
+                        tmp_dt = []
+                        if not decision_tree.finished:
+                            nodes = decision_tree.cur_depth_nodes
+                            for node in range(len(nodes)):
+                                split_scores = [np.array(data[i][counter_split][counter_dt][node]) \
+                                        for i in range(len(data))]
+                                sum_split_score = np.sum(split_scores, axis=0)
+                                best_split = [np.unravel_index(np.argmin(sum_split_score), \
+                                            sum_split_score.shape), np.min(sum_split_score)]
+                                tmp_dt.append(best_split)
+                            counter_dt = counter_dt + 1
+                            tmp_split.append(tmp_dt)
+                    counter_split = counter_split + 1
+                    if len(tmp_split) > 0:
+                        global_splits.append(tmp_split)
+            self.broadcast_data(global_splits, send_to_self=False)
+        
+        else:
+            global_splits = self.await_data()
+
         rf_models = self.load('rf_models')
         depth = self.load('depth')
         max_depth = self.load('max_depth')
         X_hist = self.load('X_hist')
         y = self.load('y')
         counter_split = 0
-
-        best_global_splits = self.await_data()
         
         for split in range(len(X_hist)):
             rf_model = rf_models[split]
@@ -534,10 +506,10 @@ class ObtainSplitState(AppState):
                         depth_nodes = decision_tree.cur_depth_nodes
                         next_depth_nodes = []
                         for dn, node in enumerate(depth_nodes):
-                            node.feature = decision_tree.feat_idcs[best_global_splits\
+                            node.feature = decision_tree.feat_idcs[global_splits\
                                                             [counter_split][counter_dt][dn][0][0]]
-                            node.threshold = best_global_splits[counter_split][counter_dt][dn][0][1]
-                            node.score = best_global_splits[counter_split][counter_dt][dn][1]
+                            node.threshold = global_splits[counter_split][counter_dt][dn][0][1]
+                            node.score = global_splits[counter_split][counter_dt][dn][1]
                         
                             left_idcs = np.where(X_hist[split][node.samples, node.feature] <= \
                                                  node.threshold)[0]
@@ -581,8 +553,7 @@ class LocalStoppingCriteria(AppState):
     """
 
     def register(self):
-        self.register_transition('aggregate_stopping_criteria', Role.COORDINATOR)
-        self.register_transition('obtain_stopping_criteria', Role.PARTICIPANT)
+        self.register_transition('stopping_criteria', Role.BOTH)
 
     def run(self) -> str or None:
         rf_models = self.load('rf_models')
@@ -601,92 +572,17 @@ class LocalStoppingCriteria(AppState):
                 
                 if len(tmp_split) > 0:
                     stopping_criteria.append(tmp_split)
-        self.send_data_to_coordinator(stopping_criteria, use_smpc=False)
+        self.send_data_to_coordinator(stopping_criteria)
     
-        if self.is_coordinator:
-            return 'aggregate_stopping_criteria'
-
-        return 'obtain_stopping_criteria'
+        return 'stopping_criteria'
 
 
-@app_state('aggregate_stopping_criteria', Role.COORDINATOR)
-class AggregateStoppingCriteria(AppState):
+@app_state('stopping_criteria', Role.BOTH)
+class StoppingCriteria(AppState):
 
     """
     The coordinator receives from each participant if a node is already a local leaf node
     and aggregates the information to check if a node is a global leaf node.
-    """
-
-    def register(self):
-        self.register_transition('obtain_stopping_criteria', Role.COORDINATOR)
-
-    def run(self) -> str or None:
-        rf_models = self.load('rf_models')
-        min_samples_split = self.load('min_samples_split')
-        min_samples_leaf = self.load('min_samples_leaf')
-
-        data = self.gather_data()
-        cur_global_leaves = []
-        next_global_leaves = []
-        del_next = []
-        counter_split = 0
-
-        for split in range(len(self.load('X_hist'))):
-            rf_model = rf_models[split]
-            if not rf_model.finished: 
-                split_cur_global_leaves = []
-                split_next_global_leaves = []
-                split_del_next = []   
-                counter_dt = 0
-                
-                for decision_tree in rf_model.decision_trees:
-                    if not decision_tree.finished:
-                        dt_cur_global_leaves = np.empty((0,))
-                        dt_next_global_leaves = np.empty((0,)) 
-                        dt_del_next = np.empty((0,)) 
-
-                        n_samples = [np.array(data[i][counter_split][counter_dt][1]) for i in \
-                                     range(len(data))]
-                        aggr_n_samples = np.sum(n_samples, axis=0)
-
-                        idcs_min_split = np.where(aggr_n_samples < min_samples_split)[0]
-                        if len(idcs_min_split) > 0:
-                            dt_next_global_leaves = np.union1d(dt_next_global_leaves, \
-                                                               idcs_min_split)
-                            
-                        idcs_min_leaf = np.where(aggr_n_samples < min_samples_leaf)[0]
-                        if len(idcs_min_leaf) > 0:
-                            parent = np.floor(idcs_min_leaf / 2)
-                            dt_cur_global_leaves = np.union1d(dt_cur_global_leaves, parent)
-                            dt_del_next = np.union1d(dt_del_next, 2 * parent)
-                            dt_del_next = np.union1d(dt_del_next, 2 * parent + 1)
-                        
-                        n_local_leaves = [np.array(data[i][counter_split][counter_dt][0]) for i \
-                                          in range(len(data))]
-                        aggr_n_local_leaves = np.sum(n_local_leaves, axis=0)
-                        idcs_all_local_leaves = np.where(aggr_n_local_leaves == \
-                                                         len(self.clients))[0]
-                        if len(idcs_all_local_leaves) > 0:
-                            dt_next_global_leaves = np.union1d(dt_next_global_leaves, \
-                                                               idcs_all_local_leaves)
-                        split_cur_global_leaves.append(dt_cur_global_leaves)
-                        split_next_global_leaves.append(dt_next_global_leaves)
-                        split_del_next.append(dt_del_next)
-                        counter_dt = counter_dt + 1
-
-                cur_global_leaves.append(split_cur_global_leaves)
-                next_global_leaves.append(split_next_global_leaves)
-                del_next.append(split_del_next)
-                
-                counter_split = counter_split + 1
-        self.broadcast_data([cur_global_leaves, next_global_leaves, del_next], send_to_self=True)
-
-        return 'obtain_stopping_criteria'
-
-
-@app_state('obtain_stopping_criteria', Role.BOTH)
-class ObtainStoppingCriteria(AppState):
-    """
     The participants reveive information whether to stop or continue building the decision tree.
     """
 
@@ -695,11 +591,77 @@ class ObtainStoppingCriteria(AppState):
         self.register_transition('compute_global_leaves', Role.BOTH)
 
     def run(self) -> str or None:
+
+        if self.is_coordinator:
+            # Aggregate stopping criteria
+            rf_models = self.load('rf_models')
+            min_samples_split = self.load('min_samples_split')
+            min_samples_leaf = self.load('min_samples_leaf')
+
+            data = self.gather_data()
+            cur_global_leaves = []
+            next_global_leaves = []
+            del_next = []
+            counter_split = 0
+
+            for split in range(len(self.load('X_hist'))):
+                rf_model = rf_models[split]
+                if not rf_model.finished: 
+                    split_cur_global_leaves = []
+                    split_next_global_leaves = []
+                    split_del_next = []   
+                    counter_dt = 0
+
+                    for decision_tree in rf_model.decision_trees:
+                        if not decision_tree.finished:
+                            dt_cur_global_leaves = np.empty((0,))
+                            dt_next_global_leaves = np.empty((0,)) 
+                            dt_del_next = np.empty((0,)) 
+
+                            n_samples = [np.array(data[i][counter_split][counter_dt][1]) for i in \
+                                        range(len(data))]
+                            aggr_n_samples = np.sum(n_samples, axis=0)
+
+                            idcs_min_split = np.where(aggr_n_samples < min_samples_split)[0]
+                            if len(idcs_min_split) > 0:
+                                dt_next_global_leaves = np.union1d(dt_next_global_leaves, \
+                                                               idcs_min_split)
+                            
+                            idcs_min_leaf = np.where(aggr_n_samples < min_samples_leaf)[0]
+                            if len(idcs_min_leaf) > 0:
+                                parent = np.floor(idcs_min_leaf / 2)
+                                dt_cur_global_leaves = np.union1d(dt_cur_global_leaves, parent)
+                                dt_del_next = np.union1d(dt_del_next, 2 * parent)
+                                dt_del_next = np.union1d(dt_del_next, 2 * parent + 1)
+                        
+                            n_local_leaves = [np.array(data[i][counter_split][counter_dt][0]) for i \
+                                            in range(len(data))]
+                            aggr_n_local_leaves = np.sum(n_local_leaves, axis=0)
+                            idcs_all_local_leaves = np.where(aggr_n_local_leaves == \
+                                                         len(self.clients))[0]
+                            if len(idcs_all_local_leaves) > 0:
+                                dt_next_global_leaves = np.union1d(dt_next_global_leaves, \
+                                                               idcs_all_local_leaves)
+                            split_cur_global_leaves.append(dt_cur_global_leaves)
+                            split_next_global_leaves.append(dt_next_global_leaves)
+                            split_del_next.append(dt_del_next)
+                            counter_dt = counter_dt + 1
+
+                    cur_global_leaves.append(split_cur_global_leaves)
+                    next_global_leaves.append(split_next_global_leaves)
+                    del_next.append(split_del_next)
+                
+                    counter_split = counter_split + 1
+            data = [cur_global_leaves, next_global_leaves, del_next]
+            self.broadcast_data(data, send_to_self=False)
+
+        else:
+            data = self.await_data()
+
         rf_models = self.load('rf_models')
         depth = self.load('depth')
         max_depth = self.load('max_depth')
 
-        data = self.await_data()
         counter_split = 0
 
         for split in range(len(self.load('X_hist'))):
@@ -767,8 +729,7 @@ class ComputeGlobalLeavesState(AppState):
     """
 
     def register(self):
-        self.register_transition('aggregate_global_leaves', Role.COORDINATOR)
-        self.register_transition('construct_global_rf', Role.PARTICIPANT)
+        self.register_transition('construct_global_rf', Role.BOTH)
 
     def run(self) -> str or None:
         rf_models = self.load('rf_models')
@@ -801,63 +762,51 @@ class ComputeGlobalLeavesState(AppState):
                 tmp_split.append(tmp_dt)
             leave_values.append(tmp_split)
 
-        self.send_data_to_coordinator(leave_values, use_smpc=False)
+        self.send_data_to_coordinator(leave_values)
         
-        if self.is_coordinator:
-            return 'aggregate_global_leaves'
-            
-        return 'construct_global_rf'
-
-
-@app_state('aggregate_global_leaves', Role.COORDINATOR)
-class AggregateGlobalLeavesState(AppState):
-    """
-    The coordinator aggregates the leaf node values and sends the global values to each 
-    participant.
-    """
-
-    def register(self):
-        self.register_transition('construct_global_rf', Role.COORDINATOR)
-       
-    def run(self) -> str or None:
-        gathered_data = self.gather_data()
-        leaf_values = []
-
-        for split in range(len(self.load('X_hist'))):
-            tmp_split = []
-            for dt in range(self.load('n_estimators')):
-                local_values = [np.array(gathered_data[j][split][dt]) for j in \
-                                range(len(gathered_data))]
-                summed_values = np.sum(local_values, axis=0)
-                
-                if self.load('prediction_mode') == 'classification':
-                    global_values = [np.argmax(summed_values[i]) for i in range(len(summed_values))]
-                else:                
-                    values = np.array([summed_values[i][0] for i in range(len(summed_values))])
-                    n_clients = np.array([summed_values[i][1] for i in range(len(summed_values))])                    
-                    global_values = values / n_clients
-                
-                tmp_split.append(global_values)
-            leaf_values.append(tmp_split)  
-
-        self.broadcast_data(leaf_values, send_to_self=True)
-
         return 'construct_global_rf'
 
 
 @app_state('construct_global_rf', Role.BOTH)
-class ConstructGlobalRFState(AppState):
+class ConstructGlobalLeavesState(AppState):
     """
+    The coordinator aggregates the leaf node values and sends the global values to each 
+    participant.
     Construct global RandomForest(s) and set samples to None for privacy.
     """
 
     def register(self):
         self.register_transition('calculate_local_oob', Role.BOTH)
         self.register_transition('write', Role.BOTH)
-
+       
     def run(self) -> str or None:
+        if self.is_coordinator:
+            gathered_data = self.gather_data()
+            leaf_values = []
+
+            for split in range(len(self.load('X_hist'))):
+                tmp_split = []
+                for dt in range(self.load('n_estimators')):
+                    local_values = [np.array(gathered_data[j][split][dt]) for j in \
+                                    range(len(gathered_data))]
+                    summed_values = np.sum(local_values, axis=0)
+                
+                    if self.load('prediction_mode') == 'classification':
+                        global_values = [np.argmax(summed_values[i]) for i in range(len(summed_values))]
+                    else:                
+                        values = np.array([summed_values[i][0] for i in range(len(summed_values))])
+                        n_clients = np.array([summed_values[i][1] for i in range(len(summed_values))])                    
+                        global_values = values / n_clients
+                
+                    tmp_split.append(global_values)
+                leaf_values.append(tmp_split)  
+
+            self.broadcast_data(leaf_values, send_to_self=False)
+        
+        else:
+            leaf_values = self.await_data()
+        
         rf_models = self.load('rf_models')
-        labels = self.await_data()
         classes = self.load('classes')
 
         for split in range(len(self.load('X_hist'))):
@@ -866,9 +815,9 @@ class ConstructGlobalRFState(AppState):
                 decision_tree.samples = None
                 for l, leaf in enumerate(decision_tree.leaves):
                     if self.load('prediction_mode') == 'classification':
-                        leaf.value = classes[labels[split][dt][l]]
+                        leaf.value = classes[leaf_values[split][dt][l]]
                     else:
-                        leaf.value = labels[split][dt][l]
+                        leaf.value = leaf_values[split][dt][l]
         
         if self.load('oob'):
             return 'calculate_local_oob'
@@ -880,7 +829,6 @@ class ConstructGlobalRFState(AppState):
 class CalculateLocalOOBState(AppState):
 
     def register(self):
-        self.register_transition('aggregate_oob', Role.COORDINATOR)
         self.register_transition('get_global_oob', Role.BOTH)
 
     def run(self) -> str or None:
@@ -900,53 +848,44 @@ class CalculateLocalOOBState(AppState):
                 tmp_split.append([oob_error, len(y[split])])
             local_oob_error.append(tmp_split)
 
-        self.send_data_to_coordinator(local_oob_error, use_smpc=False)
-        
-        if self.is_coordinator:
-            return 'aggregate_oob'
+        self.send_data_to_coordinator(local_oob_error)
         
         return 'get_global_oob'
 
-
-@app_state('aggregate_oob', Role.COORDINATOR)
-class AggregateOOBState(AppState):
-
-    def register(self):
-        self.register_transition('get_global_oob', Role.COORDINATOR)
-
-    def run(self) -> str or None:
-        gathered_data = self.gather_data()
-        weights = []
-        for split in range(len(self.load('X_hist'))):
-            tmp_dt = []
-            for dt in range(self.load('n_estimators')):
-                local_values = [np.array(gathered_data[j][split][dt]) for j in \
-                                range(len(gathered_data))]
-                oob = np.sum(local_values, axis=0)                 
-                global_oob = oob[0] / oob[1]
-                global_acc = 1 - global_oob
-                tmp_dt.append(global_acc)
-            
-            normalized_oob_acc = tmp_dt / np.sum(tmp_dt)
-            weights.append(normalized_oob_acc)
-        
-        self.broadcast_data(weights, send_to_self=True)
-        return 'get_global_oob'
-    
 
 @app_state('get_global_oob', Role.BOTH)
-class GetGlobalOOBState(AppState):
+class AggregateOOBState(AppState):
 
     def register(self):
         self.register_transition('write', Role.BOTH)
 
     def run(self) -> str or None:
-        data = self.await_data()
+        if is_coordinator:
+            gathered_data = self.gather_data()
+            weights = []
+            for split in range(len(self.load('X_hist'))):
+                tmp_dt = []
+                for dt in range(self.load('n_estimators')):
+                    local_values = [np.array(gathered_data[j][split][dt]) for j in \
+                                    range(len(gathered_data))]
+                    oob = np.sum(local_values, axis=0)                 
+                    global_oob = oob[0] / oob[1]
+                    global_acc = 1 - global_oob
+                    tmp_dt.append(global_acc)
+            
+                normalized_oob_acc = tmp_dt / np.sum(tmp_dt)
+                weights.append(normalized_oob_acc)
+        
+            self.broadcast_data(weights, send_to_self=False)
+        
+        else:
+            weights = self.await_data()
+
         rf_models = self.load('rf_models')
         for split in range(len(self.load('X_hist'))):
             rf_model = rf_models[split]
             for dt, decision_tree in enumerate(rf_model.decision_trees):
-                decision_tree.weight = data[split][dt]
+                decision_tree.weight = weights[split][dt]
         return 'write'
 
 
