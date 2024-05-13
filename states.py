@@ -167,8 +167,10 @@ class AggregateBinningState(AppState):
                 min_max_values = np.array(data)
                 min_values = np.minimum.reduce(min_max_values[:, 0])
                 max_values = np.maximum.reduce(min_max_values[:, 1])
-                bins = [np.linspace(min_values[i], max_values[i], \
-                                        n_bins + 1) for i in range(len(min_values))]
+                bins = [np.linspace(float(min_values[i]), float(max_values[i]), \
+                    n_bins + 1) for i in range(len(min_values))]
+
+
                 split_points_bucket.append([b[:-1] for b in bins])
 
             data = [broadcast_data_quantile, split_points_bucket]
@@ -486,7 +488,6 @@ class AggregateSplitState(AppState):
                     if len(tmp_split) > 0:
                         global_splits.append(tmp_split)
             self.broadcast_data(global_splits, send_to_self=False)
-        
         else:
             global_splits = self.await_data()
 
