@@ -1,3 +1,4 @@
+import os
 import bios
 import pandas as pd
 
@@ -5,7 +6,10 @@ INPUT_DIR = '/mnt/input'
 OUTPUT_DIR = '/mnt/output'
 
 def read_config():
-    config = bios.read(f'{INPUT_DIR}/config.yml')['fc-rand-forest']
+    config_name = "config.yml"
+    if not os.path.exists(f'{INPUT_DIR}/{config_name}'):
+        config_name = "config.yaml"
+    config = bios.read(f'{INPUT_DIR}/{config_name}')['fc-rand-forest']
     config_input = config['input']
     train = config_input[0]['train']
     test_input = config_input[1]['test']
