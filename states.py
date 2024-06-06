@@ -27,7 +27,7 @@ class InitialState(AppState):
             n_bins, oob = read_config()
 
         self.log('Read data...')
-        X, y, X_test, y_test = [], [], [], []  
+        X, y, X_test, y_test = [], [], [], []
         if len(quantile) > 0:
             if ',' in quantile:
                 quantile = np.fromstring(quantile, dtype=int, sep=',')
@@ -35,22 +35,30 @@ class InitialState(AppState):
                 quantile = np.array([int(quantile)])
         else:
             quantile = np.empty(0, dtype=int)
-        
+
         if split_mode == 'directory':
             for split_name in os.listdir('/mnt/input/' + split_dir):
                 X_, y_, X_test_, y_test_ = read_files(os.path.join(split_dir, split_name, \
                      train), os.path.join(split_dir, split_name, test_input), sep, label_col)
+                # Ensure that test and train are compatible
+                if X_.shape[1] != X_test_.shape[1]:
+                    raise ValueError('Number of features in train and test data must be equal.')
+                # Ensure that X_ and X_test_ are copmpletely numerical
+                if not np.issubdtype(X_.dtype, np.number) or not np.issubdtype(X_test_.dtype, np.number):
+                    raise ValueError('All columns in test and train must be numerical.')
                 X.append(X_)
                 y.append(y_)
                 X_test.append(X_test_)
                 y_test.append(y_test_)
         else:
             X_, y_, X_test_, y_test_ = read_files(train, test_input, sep, label_col)
+            if X_.shape[1] != X_test_.shape[1]:
+                raise ValueError('Number of features in train and test data must be equal.')
             X.append(X_)
             y.append(y_)
             X_test.append(X_test_)
             y_test.append(y_test_)
-        
+
         np.random.seed(random_state)
 
         # Store parameters from config file
@@ -77,17 +85,17 @@ class InitialState(AppState):
         self.store('n_bins', n_bins)
 
         self.store('oob', oob)
-        
+
         if self.load('prediction_mode') == 'regression':
             self.store('oob', False)
-        
+
         # Store data
         self.store('X', X)
         self.store('y', y)
         self.store('X_test', X_test)
         self.store('y_test', y_test)
         self.store('classes', np.unique(y[0]))
-        
+
         self.store('n_features', X[0].shape[1])
         self.store('depth', 0)
 
@@ -97,15 +105,15 @@ class InitialState(AppState):
 @app_state('local_binning', Role.BOTH)
 class LocalBinningState(AppState):
     """
-    Calculate values for z-score normalization and determine local minima and maxima 
+    Calculate values for z-score normalization and determine local minima and maxima
     for bucket binning and send these values to the coordinator.
     """
 
     def register(self):
         self.register_transition('aggregate_binning', Role.BOTH)
-        
+
     def run(self) -> str or None:
-        
+
         # Normalize data for quantile binning
         X = self.load('X')
         quantile_idcs = self.load('quantile')
@@ -113,7 +121,7 @@ class LocalBinningState(AppState):
         for split in range(len(X)):
             X_quantile = X[split][:, quantile_idcs]
             local_matrix = np.zeros((X_quantile.shape[1], 3))
-            local_matrix[:, 0] = X_quantile.shape[0]  
+            local_matrix[:, 0] = X_quantile.shape[0]
             local_matrix[:, 1] = np.sum(np.square(X_quantile), axis=0)
             local_matrix[:, 2] = np.sum(X_quantile, axis=0)
             local_matrix_list.append(local_matrix)
@@ -126,7 +134,7 @@ class LocalBinningState(AppState):
             min_array = np.min(X[split][:, bucket_idcs], axis=0)
             max_array = np.max(X[split][:, bucket_idcs], axis=0)
             send_data_bucket.append(np.array([min_array, max_array]))
-        
+
         self.send_data_to_coordinator([local_matrix_list, send_data_bucket])
 
         return 'aggregate_binning'
@@ -143,7 +151,7 @@ class AggregateBinningState(AppState):
 
     def register(self):
         self.register_transition('global_binning', Role.BOTH)
-        
+
     def run(self) -> str or None:
         if self.is_coordinator:
             gathered_data = self.gather_data()
@@ -197,7 +205,7 @@ class AggregateBinningState(AppState):
             X_hist = np.array([np.digitize(X_T[i], split_points[i]) \
                                     for i in range(X_T.shape[0])]) - 1
             tmp_X_hist.append(X_hist)
-        
+
         self.store('split_points_bucket', tmp_split_points)
         self.store('X_hist_bucket', tmp_X_hist)
 
@@ -245,7 +253,7 @@ class GlobalQuantileBinningState(AppState):
         n_bins = self.load('n_bins')
         X = self.load('X_normalized_quantile')
         X_hist_list = []
-        
+
         percentiles = np.linspace(1 / n_bins, 1 - 1 / n_bins, n_bins - 1)
         split_points = [norm.ppf(p) for p in percentiles]
         split_points = np.concatenate((split_points, [np.inf]))
@@ -260,7 +268,7 @@ class GlobalQuantileBinningState(AppState):
             X_hist_list.append(X_hist)
 
             split_points_quantile.append(np.tile(split_points, (len(X[split][0]), 1)))
-        
+
         self.store('split_points_quantile', split_points_quantile)
         self.store('X_hist_quantile', X_hist_list)
 
@@ -272,7 +280,7 @@ class CombineBinningState(AppState):
     """
     Concatenate Quantile Binning Data and Bucket Binning Data.
     """
-        
+
     def register(self):
         self.register_transition('feat_idcs', Role.BOTH)
 
@@ -280,7 +288,7 @@ class CombineBinningState(AppState):
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         bucket_idcs = np.setdiff1d(np.arange(len(X[0][0])), quantile_idcs)
-        
+
         X_hist_quantile = self.load('X_hist_quantile')
         X_hist_bucket = self.load('X_hist_bucket')
         X_hist_list = []
@@ -302,11 +310,11 @@ class CombineBinningState(AppState):
                 split_points[quantile_idcs] = split_points_quantile[split]
                 split_points[bucket_idcs] = split_points_bucket[split]
                 split_points_list.append(split_points)
-            
-            elif len(bucket_idcs) > 0: 
+
+            elif len(bucket_idcs) > 0:
                 X_hist_list.append(np.transpose(X_hist_bucket[split]))
                 split_points_list.append(split_points_bucket[split])
-            
+
             else:
                 X_hist_list.append(np.transpose(X_hist_quantile[split]))
                 split_points_list.append(split_points_quantile[split])
@@ -332,7 +340,7 @@ class FeatureIndicesState(AppState):
         if self.is_coordinator:
             n_features = self.load('n_features')
             max_features = self.load('max_features')
-            
+
             if max_features == 'sqrt':
                 max_features = int(np.sqrt(n_features))
             elif max_features < 1:
@@ -340,7 +348,7 @@ class FeatureIndicesState(AppState):
             else:
                 max_features = int(max_features)
             self.store('max_features', max_features)
-            
+
             RF_feat_idcs = []
             for _ in range(self.load('n_estimators')):
                 feat_idcs = np.random.choice(n_features, size= \
@@ -348,13 +356,13 @@ class FeatureIndicesState(AppState):
                 RF_feat_idcs.append(feat_idcs)
             RF_feat_idcs = np.array(RF_feat_idcs)
             self.broadcast_data(RF_feat_idcs, send_to_self=False)
-        
+
         else:
             RF_feat_idcs = self.await_data()
-        
+
         self.store('RF_feat_idcs', RF_feat_idcs)
         return 'init_forest'
- 
+
 
 @app_state('init_forest', Role.BOTH)
 class InitForestState(AppState):
@@ -450,7 +458,7 @@ class LocalSplitState(AppState):
 @app_state('aggregate_splits', Role.BOTH)
 class AggregateSplitState(AppState):
     """
-    The coordinator receives the local split scores from each client, aggreagtes them and 
+    The coordinator receives the local split scores from each client, aggreagtes them and
     chooses the feature-threshold combination with the minimal score value for splitting.
     The participants receive the best feature-threshold combination for splitting the data
     and they split the data based on the received feature and threshold.
@@ -465,7 +473,7 @@ class AggregateSplitState(AppState):
             data = self.gather_data()
             global_splits = []
             counter_split = 0
-  
+
             for split in range(len(self.load('X_hist'))):
                 rf_model = rf_models[split]
                 tmp_split = []
@@ -497,7 +505,7 @@ class AggregateSplitState(AppState):
         X_hist = self.load('X_hist')
         y = self.load('y')
         counter_split = 0
-        
+
         for split in range(len(X_hist)):
             rf_model = rf_models[split]
             if not rf_model.finished:
@@ -511,7 +519,7 @@ class AggregateSplitState(AppState):
                                                             [counter_split][counter_dt][dn][0][0]]
                             node.threshold = global_splits[counter_split][counter_dt][dn][0][1]
                             node.score = global_splits[counter_split][counter_dt][dn][1]
-                        
+
                             left_idcs = np.where(X_hist[split][node.samples, node.feature] <= \
                                                  node.threshold)[0]
                             right_idcs = np.where(X_hist[split][node.samples, node.feature] > \
@@ -525,18 +533,18 @@ class AggregateSplitState(AppState):
                             if((len(right_idcs) == 0) or len(np.unique(y[split][node.samples\
                                                                             [right_idcs]])) == 1):
                                 right_child.local_leaf = True
-                                
+
                             node.left = left_child
                             node.left.parent = node
                             node.right = right_child
                             node.right.parent = node
                             next_depth_nodes.append(left_child)
                             next_depth_nodes.append(right_child)
-                        
+
                         decision_tree.next_depth_nodes = next_depth_nodes
 
                         counter_dt = counter_dt + 1
-                
+
                 counter_split = counter_split + 1
 
         self.store('rf_models', rf_models)
@@ -545,8 +553,8 @@ class AggregateSplitState(AppState):
         self.update(message=f'Depth {depth+1} of {max_depth}', progress=float(depth / max_depth))
 
         return 'local_stopping_criteria'
-    
-   
+
+
 @app_state('local_stopping_criteria', Role.BOTH)
 class LocalStoppingCriteria(AppState):
     """
@@ -570,11 +578,11 @@ class LocalStoppingCriteria(AppState):
                                                 decision_tree.next_depth_nodes))
                         n_samples = [len(node.samples) for node in decision_tree.next_depth_nodes]
                         tmp_split.append([local_leaves, n_samples])
-                
+
                 if len(tmp_split) > 0:
                     stopping_criteria.append(tmp_split)
         self.send_data_to_coordinator(stopping_criteria)
-    
+
         return 'stopping_criteria'
 
 
@@ -607,17 +615,17 @@ class StoppingCriteria(AppState):
 
             for split in range(len(self.load('X_hist'))):
                 rf_model = rf_models[split]
-                if not rf_model.finished: 
+                if not rf_model.finished:
                     split_cur_global_leaves = []
                     split_next_global_leaves = []
-                    split_del_next = []   
+                    split_del_next = []
                     counter_dt = 0
 
                     for decision_tree in rf_model.decision_trees:
                         if not decision_tree.finished:
                             dt_cur_global_leaves = np.empty((0,))
-                            dt_next_global_leaves = np.empty((0,)) 
-                            dt_del_next = np.empty((0,)) 
+                            dt_next_global_leaves = np.empty((0,))
+                            dt_del_next = np.empty((0,))
 
                             n_samples = [np.array(data[i][counter_split][counter_dt][1]) for i in \
                                         range(len(data))]
@@ -627,14 +635,14 @@ class StoppingCriteria(AppState):
                             if len(idcs_min_split) > 0:
                                 dt_next_global_leaves = np.union1d(dt_next_global_leaves, \
                                                                idcs_min_split)
-                            
+
                             idcs_min_leaf = np.where(aggr_n_samples < min_samples_leaf)[0]
                             if len(idcs_min_leaf) > 0:
                                 parent = np.floor(idcs_min_leaf / 2)
                                 dt_cur_global_leaves = np.union1d(dt_cur_global_leaves, parent)
                                 dt_del_next = np.union1d(dt_del_next, 2 * parent)
                                 dt_del_next = np.union1d(dt_del_next, 2 * parent + 1)
-                        
+
                             n_local_leaves = [np.array(data[i][counter_split][counter_dt][0]) for i \
                                             in range(len(data))]
                             aggr_n_local_leaves = np.sum(n_local_leaves, axis=0)
@@ -651,7 +659,7 @@ class StoppingCriteria(AppState):
                     cur_global_leaves.append(split_cur_global_leaves)
                     next_global_leaves.append(split_next_global_leaves)
                     del_next.append(split_del_next)
-                
+
                     counter_split = counter_split + 1
             data = [cur_global_leaves, next_global_leaves, del_next]
             self.broadcast_data(data, send_to_self=False)
@@ -680,11 +688,11 @@ class StoppingCriteria(AppState):
                         for node in global_cur_depth_nodes.astype(int):
                             cur_depth_nodes[node].global_leaf = True
                             decision_tree.leaves.append(cur_depth_nodes[node])
-                        
+
                         for node in global_next_depth_nodes.astype(int):
                             next_depth_nodes[node].global_leaf = True
                             decision_tree.leaves.append(next_depth_nodes[node])
-                        
+
                         for node in del_next.astype(int):
                             next_depth_nodes[node].parent.left = None
                             next_depth_nodes[node].parent.right = None
@@ -694,7 +702,7 @@ class StoppingCriteria(AppState):
 
                         new_next_depth_nodes = [node for idx, node in enumerate(next_depth_nodes) \
                                                 if idx not in remove_from_next]
-                        
+
                         if max_depth is not None and depth == max_depth:
                             decision_tree.next_depth_nodes = []
 
@@ -711,7 +719,7 @@ class StoppingCriteria(AppState):
 
                 if all(decision_tree.finished for decision_tree in rf_model.decision_trees):
                     rf_model.finished = True
-                
+
                 counter_split = counter_split + 1
 
         all_finished = all(rf_model.finished for rf_model in rf_models)
@@ -719,7 +727,7 @@ class StoppingCriteria(AppState):
         if all_finished or max_depth is not None and depth == max_depth:
             self.update(message='Get leaf nodes')
             return 'compute_global_leaves'
-        
+
         return 'find_local_splits'
 
 
@@ -745,7 +753,7 @@ class ComputeGlobalLeavesState(AppState):
                     decision_tree.leaves.extend(decision_tree.cur_depth_nodes)
                     for node in decision_tree.cur_depth_nodes:
                         node.global_leaf = True
-        
+
         for split in range(len(self.load('X_hist'))):
             rf_model = rf_models[split]
             tmp_split = []
@@ -764,14 +772,14 @@ class ComputeGlobalLeavesState(AppState):
             leave_values.append(tmp_split)
 
         self.send_data_to_coordinator(leave_values)
-        
+
         return 'construct_global_rf'
 
 
 @app_state('construct_global_rf', Role.BOTH)
 class ConstructGlobalLeavesState(AppState):
     """
-    The coordinator aggregates the leaf node values and sends the global values to each 
+    The coordinator aggregates the leaf node values and sends the global values to each
     participant.
     Construct global RandomForest(s) and set samples to None for privacy.
     """
@@ -779,7 +787,7 @@ class ConstructGlobalLeavesState(AppState):
     def register(self):
         self.register_transition('calculate_local_oob', Role.BOTH)
         self.register_transition('write', Role.BOTH)
-       
+
     def run(self) -> str or None:
         if self.is_coordinator:
             gathered_data = self.gather_data()
@@ -791,22 +799,22 @@ class ConstructGlobalLeavesState(AppState):
                     local_values = [np.array(gathered_data[j][split][dt]) for j in \
                                     range(len(gathered_data))]
                     summed_values = np.sum(local_values, axis=0)
-                
+
                     if self.load('prediction_mode') == 'classification':
                         global_values = [np.argmax(summed_values[i]) for i in range(len(summed_values))]
-                    else:                
+                    else:
                         values = np.array([summed_values[i][0] for i in range(len(summed_values))])
-                        n_clients = np.array([summed_values[i][1] for i in range(len(summed_values))])                    
+                        n_clients = np.array([summed_values[i][1] for i in range(len(summed_values))])
                         global_values = values / n_clients
-                
+
                     tmp_split.append(global_values)
-                leaf_values.append(tmp_split)  
+                leaf_values.append(tmp_split)
 
             self.broadcast_data(leaf_values, send_to_self=False)
-        
+
         else:
             leaf_values = self.await_data()
-        
+
         rf_models = self.load('rf_models')
         classes = self.load('classes')
 
@@ -819,10 +827,10 @@ class ConstructGlobalLeavesState(AppState):
                         leaf.value = classes[leaf_values[split][dt][l]]
                     else:
                         leaf.value = leaf_values[split][dt][l]
-        
+
         if self.load('oob'):
             return 'calculate_local_oob'
-        
+
         return 'write'
 
 
@@ -850,7 +858,7 @@ class CalculateLocalOOBState(AppState):
             local_oob_error.append(tmp_split)
 
         self.send_data_to_coordinator(local_oob_error)
-        
+
         return 'get_global_oob'
 
 
@@ -869,16 +877,16 @@ class AggregateOOBState(AppState):
                 for dt in range(self.load('n_estimators')):
                     local_values = [np.array(gathered_data[j][split][dt]) for j in \
                                     range(len(gathered_data))]
-                    oob = np.sum(local_values, axis=0)                 
+                    oob = np.sum(local_values, axis=0)
                     global_oob = oob[0] / oob[1]
                     global_acc = 1 - global_oob
                     tmp_dt.append(global_acc)
-            
+
                 normalized_oob_acc = tmp_dt / np.sum(tmp_dt)
                 weights.append(normalized_oob_acc)
-        
+
             self.broadcast_data(weights, send_to_self=False)
-        
+
         else:
             weights = self.await_data()
 
@@ -921,7 +929,7 @@ class WriteState(AppState):
                              {'pred': y_pred})
                 write_output(os.path.join(base_dir_out, split_name, self.load('test_output')), \
                              {'y_true': y_true[i]})
-                joblib.dump(rf_model, os.path.join(base_dir_out, split_name, 'rf_model.pkl')) 
+                joblib.dump(rf_model, os.path.join(base_dir_out, split_name, 'rf_model.pkl'))
         elif self.load('split_mode') == 'file':
             rf_model = rf_models[0]
             y_pred = rf_model.predict(X_test[0])
