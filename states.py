@@ -936,6 +936,6 @@ class WriteState(AppState):
             write_output(os.path.join(base_dir_out, self.load('pred')), {'pred': y_pred})
             write_output(os.path.join(base_dir_out, self.load('test_output')), \
                          {'y_true': y_true[0]})
-            joblib.dump(rf_model, os.path.join(base_dir_out, 'rf_model.pkl'))
+            joblib.dump(rf_model, os.path.join(base_dir_out, 'rf_model.joblib'))
 
         return 'terminal'
