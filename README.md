@@ -1,12 +1,14 @@
 # Histogram-Based Federated Random Forest FeatureCloud App
 
 ## Description
-A Random Forest FeautureCloud app, allowing a federated computation of the random forest algorithm.
-Supports both classification and regression.
+A Random Forest FeautureCloud app, allowing an iterative federated computation of the random forest algorithm.
+Supports single-class classification. The multiclass classification and regression are to be added. 
 
 ## Input
 - train.csv containing the local training data (columns: features; rows: samples)
 - test.csv containing the local test data
+### Important Note:
+- For single-class classification problems, all the entries of both train and test data must be converted to numerical values like float or int. The "Str" type is not compatible. 
 
 
 ## Output
