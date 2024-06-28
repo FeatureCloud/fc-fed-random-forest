@@ -24,7 +24,7 @@ class RandomForest:
         self.prediction_mode = prediction_mode
         self.oob = oob
         self.finished = False
-    
+
     def init_trees(self, y):
         self.estimators = []
         for i in range(self.n_estimators):
@@ -98,7 +98,7 @@ class RandomForest:
         y = np.array([tree.predict(X_hist) for tree in self.decision_trees])
         # Reshape so we can find the most common value
         y = np.swapaxes(y, axis1=0, axis2=1)
-        
+
         if self.prediction_mode == 'classification':
             if not self.oob:
                 # Use majority voting for the final prediction
@@ -114,7 +114,7 @@ class RandomForest:
                     predicted_values.append(classes[np.argmax(counter)])
         else:
             predicted_values = np.mean(y, axis=0)
- 
+
         return predicted_values
 
 
@@ -161,6 +161,6 @@ class Node:
         self.global_leaf = global_leaf
         self.local_leaf = local_leaf
         self.value = value
-    
+
     def is_leaf_node(self):
         return self.global_leaf

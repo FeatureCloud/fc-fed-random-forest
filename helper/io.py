@@ -43,10 +43,12 @@ def read_config():
 
     oob = config.get('oob', False)
 
+    weight_classes_bool = config.get('use_weighted_classes', False)
+
     return train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, \
             n_estimators, criterion, max_depth, min_samples_split, min_samples_leaf, \
             max_features, bootstrap, max_samples, random_state, prediction_mode, quantile, \
-            n_bins, oob
+            n_bins, oob, weight_classes_bool
 
 def convert_to_np(data):
     if isinstance(data, (pd.Series, pd.DataFrame)):

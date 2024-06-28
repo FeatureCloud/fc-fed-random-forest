@@ -21,3 +21,4 @@ fc-rand-forest:
   random_state: 42
   mode: 'classification'
   n_bins: 10
+  use_weighted_classes: False

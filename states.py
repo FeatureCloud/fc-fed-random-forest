@@ -5,6 +5,7 @@ import joblib
 from scipy.stats import norm
 from FeatureCloud.app.engine.app import AppState, app_state, Role
 from helper.io import read_config, read_files
+from helper.util import validate_input_data
 from RandomForest.models import RandomForest, Node
 from RandomForest.splitting import split_score
 
@@ -24,7 +25,7 @@ class InitialState(AppState):
         train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, \
             n_estimators, criterion, max_depth, min_samples_split, min_samples_leaf, \
             max_features, bootstrap, max_samples, random_state, prediction_mode, quantile, \
-            n_bins, oob = read_config()
+            n_bins, oob, weight_classes_bool = read_config()
 
         self.log('Read data...')
         X, y, X_test, y_test = [], [], [], []
@@ -40,20 +41,14 @@ class InitialState(AppState):
             for split_name in os.listdir('/mnt/input/' + split_dir):
                 X_, y_, X_test_, y_test_ = read_files(os.path.join(split_dir, split_name, \
                      train), os.path.join(split_dir, split_name, test_input), sep, label_col)
-                # Ensure that test and train are compatible
-                if X_.shape[1] != X_test_.shape[1]:
-                    raise ValueError('Number of features in train and test data must be equal.')
-                # Ensure that X_ and X_test_ are copmpletely numerical
-                if not np.issubdtype(X_.dtype, np.number) or not np.issubdtype(X_test_.dtype, np.number):
-                    raise ValueError('All columns in test and train must be numerical.')
+                validate_input_data(X_, y_, X_test_, y_test_)
                 X.append(X_)
                 y.append(y_)
                 X_test.append(X_test_)
                 y_test.append(y_test_)
         else:
             X_, y_, X_test_, y_test_ = read_files(train, test_input, sep, label_col)
-            if X_.shape[1] != X_test_.shape[1]:
-                raise ValueError('Number of features in train and test data must be equal.')
+            validate_input_data(X_, y_, X_test_, y_test_)
             X.append(X_)
             y.append(y_)
             X_test.append(X_test_)
@@ -68,6 +63,7 @@ class InitialState(AppState):
         self.store('label_col', label_col)
         self.store('split_mode', split_mode)
         self.store('split_dir', split_dir)
+        self.store('weight_classes_bool', weight_classes_bool)
 
         # Parameters RandomForest
         self.store('n_estimators', n_estimators)
@@ -87,6 +83,8 @@ class InitialState(AppState):
         self.store('oob', oob)
 
         if self.load('prediction_mode') == 'regression':
+            if weight_classes_bool:
+                raise ValueError('Weights are not supported for regression, there are no classes to weight in regression')
             self.store('oob', False)
 
         # Store data
@@ -322,6 +320,25 @@ class CombineBinningState(AppState):
         self.store('X_hist', X_hist_list)
         self.store('split_points', split_points_list)
 
+        # As it can happen that one client does not have all classes,
+        # we need to communicate the classes to all clients
+        # if we weight the samples by class occurence, we also need to communicate
+        # the class frequencies
+        class_frequencies = list()
+        y = self.load('y')
+        classes = self.load('classes')
+        use_weights = self.load('weight_classes_bool')
+        for _y in y:
+            frequency_dict = dict()
+            for class_i in classes:
+                if use_weights:
+                    frequency_dict[class_i] = np.sum(_y == class_i)
+                else:
+                    frequency_dict[class_i] = 0
+            class_frequencies.append(frequency_dict)
+
+        self.send_data_to_coordinator(class_frequencies, memo="classes")
+
         return 'feat_idcs'
 
 
@@ -338,6 +355,40 @@ class FeatureIndicesState(AppState):
         self.log('Choose feature indices...')
 
         if self.is_coordinator:
+            # not we gather which classes exist in the data
+            class_frequencies = self.gather_data(memo="classes")
+            # class_frequencies is a list of dictionaries, each dictionary
+            # contains the class frequencies of each split
+            if len(class_frequencies) <= 1:
+                raise RuntimeError("Only one client exists, cannot run the app")
+
+            # update classes to have all global classes
+            classes = set()
+            for class_frequency_list in class_frequencies:
+                for class_frequency in class_frequency_list:
+                    classes.update(class_frequency.keys())
+            classes = np.array(list(classes))
+            self.store('classes', classes)
+
+            # set weights if necessary
+            self.store('weights', None)
+            if self.load('weight_classes_bool'):
+                weights = dict()
+                total_samples = 0
+                for class_frequency_list in class_frequencies:
+                    for class_frequency in class_frequency_list:
+                        for class_i, frequency in class_frequency.items():
+                            if class_i not in weights:
+                                weights[class_i] = 0
+                            weights[class_i] += frequency
+                            total_samples += frequency
+                for class_i, frequency in weights.items():
+                    if frequency != 0:
+                        weights[class_i] = total_samples / frequency
+                    else:
+                        weights[class_i] = 0
+                self.store('weights', weights)
+
             n_features = self.load('n_features')
             max_features = self.load('max_features')
 
@@ -355,10 +406,14 @@ class FeatureIndicesState(AppState):
                                                 max_features, replace=False)
                 RF_feat_idcs.append(feat_idcs)
             RF_feat_idcs = np.array(RF_feat_idcs)
-            self.broadcast_data(RF_feat_idcs, send_to_self=False)
+            self.broadcast_data([RF_feat_idcs,
+                                 self.load('classes'),
+                                 self.load('weights')], send_to_self=False)
 
         else:
-            RF_feat_idcs = self.await_data()
+            RF_feat_idcs, classes, weights = tuple(self.await_data())
+            self.store('classes', classes)
+            self.store('weights', weights)
 
         self.store('RF_feat_idcs', RF_feat_idcs)
         return 'init_forest'
@@ -441,7 +496,8 @@ class LocalSplitState(AppState):
                                 local_split_score = split_score(X_hist[split][node.samples], \
                                                 y[split][node.samples], decision_tree.feat_idcs, \
                                                 n_bins, self.load('prediction_mode'), \
-                                                self.load('classes'))
+                                                classes=self.load('classes'), \
+                                                weights=self.load('weights'))
                             else:
                                 local_split_score = [[0] * n_bins for _ in \
                                                      range(len(decision_tree.feat_idcs))]
@@ -937,5 +993,16 @@ class WriteState(AppState):
             write_output(os.path.join(base_dir_out, self.load('test_output')), \
                          {'y_true': y_true[0]})
             joblib.dump(rf_model, os.path.join(base_dir_out, 'rf_model.joblib'))
+            # as a user potentially has no access to the rf_model class
+            # they cannot use the model yet
+            # Therefore, we also save the source code of the model class to the
+            # output directory
+            # this is a bit hacky tbh, but probably the easiest to be able
+            # to really actually use the model
+            import RandomForest.models as model_definition
+            import inspect
+
+            with open(os.path.join(base_dir_out, 'rf_model.py'), 'w') as f:
+                f.write(inspect.getsource(model_definition))
 
         return 'terminal'

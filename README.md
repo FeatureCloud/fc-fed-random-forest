@@ -10,9 +10,17 @@ Supports both classification and regression.
 
 
 ## Output
-- pred.csv containing the predicted class or value 
-- train.csv containing the local training data
-- test.csv containing the local test data
+- `pred.csv` containing the predicted class or value 
+- `train.csv` containing the local training data
+- `test.csv` containing the local test data
+- `rfmodel.py` containing the class RandomForest. 
+  This class used for the model has the predict(self, X) method that can be used 
+  to do your own predictions. It must be loaded (e.g. imported) to be able to
+  load the model instance (`rf_model.joblib`)
+- `rf_model.joblib` containing the trained mode instance. It has a predict(self, X)
+  method to predict a dataset with the same features as the given data for training
+  Please note that RandomForest from `rfmodel.py` must be loaded to be able to
+  load this class via joblib.load(`rf_model.joblib`)
 
 ## Workflows
 Can be combined with the following apps:
@@ -47,4 +55,11 @@ fc_random_forest:
   quantile: 0,1 # feature indices for quantile binning
   random_state: 42 # random state for reproducibility
   oob: True # use out-of-bag error to weight decision trees
+  use_weighted_classes: False # if set to True, all classes are given the same 
+                              # importance, no matter how many samples 
+                              # are of each class
+                              # e.g. if a one class has 1/3 of all samples and
+                              # the other class 2/3 of all samples, then
+                              # the first class is given a weight of 3
+                              # and the second class is given a weight of 1.5
 ```
