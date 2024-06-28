@@ -373,20 +373,27 @@ class FeatureIndicesState(AppState):
             # set weights if necessary
             self.store('weights', None)
             if self.load('weight_classes_bool'):
-                weights = dict()
-                total_samples = 0
-                for class_frequency_list in class_frequencies:
-                    for class_frequency in class_frequency_list:
-                        for class_i, frequency in class_frequency.items():
-                            if class_i not in weights:
-                                weights[class_i] = 0
-                            weights[class_i] += frequency
-                            total_samples += frequency
-                for class_i, frequency in weights.items():
-                    if frequency != 0:
-                        weights[class_i] = total_samples / frequency
-                    else:
-                        weights[class_i] = 0
+                weights = list()
+                total_samples = list()
+                for split_idx, _ in enumerate(self.load("X")):
+                    split_weights = dict()
+                    split_total_samples = 0
+                    for client_class_frequencies in class_frequencies:
+                        for class_i, frequency in client_class_frequencies[split_idx].items():
+                            if class_i not in split_weights:
+                                split_weights[class_i] = 0
+                            split_weights[class_i] += frequency
+                            split_total_samples += frequency
+                    weights.append(split_weights)
+                    total_samples.append(split_total_samples)
+
+                for split_idx, weights_dict in enumerate(weights):
+                    for class_i, frequency in weights_dict.items():
+                        if frequency != 0:
+                            weights_dict[class_i] = total_samples[split_idx] / frequency
+                        else:
+                            weights_dict[class_i] = 0
+
                 self.store('weights', weights)
 
             n_features = self.load('n_features')
@@ -497,7 +504,7 @@ class LocalSplitState(AppState):
                                                 y[split][node.samples], decision_tree.feat_idcs, \
                                                 n_bins, self.load('prediction_mode'), \
                                                 classes=self.load('classes'), \
-                                                weights=self.load('weights'))
+                                                weights=self.load('weights')[split])
                             else:
                                 local_split_score = [[0] * n_bins for _ in \
                                                      range(len(decision_tree.feat_idcs))]
