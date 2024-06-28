@@ -51,9 +51,9 @@ def _gini_split(left_y: np.ndarray, right_y: np.ndarray,
     if len(left_y) == 0 or len(right_y) == 0:
         return np.float64(1.0)
     left_weights = None if weights is None else np.vectorize(weights.get)(left_y)
-    gini_left = 1.0 - np.sum((np.bincount(left_y, minlength=n_classes, weights=left_weights) / len(left_y)) ** 2)
+    gini_left = 1.0 - np.sum((np.bincount(left_y.astype('int'), minlength=n_classes, weights=left_weights) / len(left_y.astype('int'))) ** 2)
     right_weights = None if weights is None else np.vectorize(weights.get)(right_y)
-    gini_right = 1.0 - np.sum((np.bincount(right_y, minlength=n_classes, weights=right_weights) / len(right_y)) ** 2)
+    gini_right = 1.0 - np.sum((np.bincount(right_y.astype('int'), minlength=n_classes, weights=right_weights) / len(right_y.astype('int'))) ** 2)
     gini = (len(left_y) / len_y) * gini_left + (len(right_y) / len_y) * gini_right
     return gini
 
