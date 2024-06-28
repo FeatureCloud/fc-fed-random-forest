@@ -374,25 +374,23 @@ class FeatureIndicesState(AppState):
             self.store('weights', None)
             if self.load('weight_classes_bool'):
                 weights = list()
-                total_samples = list()
                 for split_idx, _ in enumerate(self.load("X")):
                     split_weights = dict()
                     split_total_samples = 0
+                    # get the pure frequency counts per split per class
                     for client_class_frequencies in class_frequencies:
                         for class_i, frequency in client_class_frequencies[split_idx].items():
                             if class_i not in split_weights:
                                 split_weights[class_i] = 0
                             split_weights[class_i] += frequency
                             split_total_samples += frequency
-                    weights.append(split_weights)
-                    total_samples.append(split_total_samples)
-
-                for split_idx, weights_dict in enumerate(weights):
-                    for class_i, frequency in weights_dict.items():
+                    # calculate the weight from the frequency plus total samples
+                    for class_i, frequency in split_weights.items():
                         if frequency != 0:
-                            weights_dict[class_i] = total_samples[split_idx] / frequency
+                            split_weights[class_i] = split_total_samples / frequency
                         else:
-                            weights_dict[class_i] = 0
+                            split_weights[class_i] = 0
+                    weights.append(split_weights)
 
                 self.store('weights', weights)
 
