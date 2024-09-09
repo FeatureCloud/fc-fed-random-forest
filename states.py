@@ -25,7 +25,7 @@ class InitialState(AppState):
         train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, \
             n_estimators, criterion, max_depth, min_samples_split, min_samples_leaf, \
             max_features, bootstrap, max_samples, random_state, prediction_mode, quantile, \
-            n_bins, oob, weight_classes_bool = read_config()
+            n_bins, oob, weight_classes_bool, output_mode = read_config()
 
         self.log('Read data...')
         X, y, X_test, y_test = [], [], [], []
@@ -64,6 +64,7 @@ class InitialState(AppState):
         self.store('split_mode', split_mode)
         self.store('split_dir', split_dir)
         self.store('weight_classes_bool', weight_classes_bool)
+        self.store('output_mode', output_mode)
 
         # Parameters RandomForest
         self.store('n_estimators', n_estimators)
@@ -973,6 +974,7 @@ class WriteState(AppState):
         rf_models = self.load('rf_models')
         X_test = self.load('X_test')
         y_true = self.load('y_test')
+        output_mode = self.load('output_mode')
 
         def write_output(path, data):
             df = pd.DataFrame(data=data)
@@ -984,20 +986,24 @@ class WriteState(AppState):
         if self.load('split_mode') == 'directory':
             for i, split_name in enumerate(os.listdir(base_dir_in)):
                 rf_model = rf_models[i]
-                y_pred = rf_model.predict(X_test[i])
-                os.makedirs(os.path.join(base_dir_out, split_name), exist_ok=True)
-                write_output(os.path.join(base_dir_out, split_name, self.load('pred')), \
-                             {'pred': y_pred})
-                write_output(os.path.join(base_dir_out, split_name, self.load('test_output')), \
-                             {'y_true': y_true[i]})
-                joblib.dump(rf_model, os.path.join(base_dir_out, split_name, 'rf_model.pkl'))
+                if output_mode in ['pred', 'model+pred']:
+                    y_pred = rf_model.predict(X_test[i])
+                    os.makedirs(os.path.join(base_dir_out, split_name), exist_ok=True)
+                    write_output(os.path.join(base_dir_out, split_name, self.load('pred')), \
+                                {'pred': y_pred})
+                    write_output(os.path.join(base_dir_out, split_name, self.load('test_output')), \
+                                {'y_true': y_true[i]})
+                if output_mode in ['model', 'model+pred']:
+                    joblib.dump(rf_model, os.path.join(base_dir_out, split_name, 'rf_model.pkl'))
         elif self.load('split_mode') == 'file':
             rf_model = rf_models[0]
-            y_pred = rf_model.predict(X_test[0])
-            write_output(os.path.join(base_dir_out, self.load('pred')), {'pred': y_pred})
-            write_output(os.path.join(base_dir_out, self.load('test_output')), \
-                         {'y_true': y_true[0]})
-            joblib.dump(rf_model, os.path.join(base_dir_out, 'rf_model.joblib'))
+            if output_mode in ['pred', 'model+pred']:
+                y_pred = rf_model.predict(X_test[0])
+                write_output(os.path.join(base_dir_out, self.load('pred')), {'pred': y_pred})
+                write_output(os.path.join(base_dir_out, self.load('test_output')), \
+                            {'y_true': y_true[0]})
+            if output_mode in ['model', 'model+pred']:
+                joblib.dump(rf_model, os.path.join(base_dir_out, 'rf_model.joblib'))
             # as a user potentially has no access to the rf_model class
             # they cannot use the model yet
             # Therefore, we also save the source code of the model class to the
@@ -1007,7 +1013,8 @@ class WriteState(AppState):
             import RandomForest.models as model_definition
             import inspect
 
-            with open(os.path.join(base_dir_out, 'rf_model.py'), 'w') as f:
-                f.write(inspect.getsource(model_definition))
+            if output_mode in ['model', 'model+pred']:
+                with open(os.path.join(base_dir_out, 'rf_model.py'), 'w') as f:
+                    f.write(inspect.getsource(model_definition))
 
         return 'terminal'

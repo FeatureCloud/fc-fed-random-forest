@@ -64,4 +64,10 @@ fc_random_forest:
                               # the other class 2/3 of all samples, then
                               # the first class is given a weight of 3
                               # and the second class is given a weight of 1.5
+  output_mode: 'model+pred' # One of ['model', 'pred', 'model+pred']
+                            # decides whether the final output contains the 
+                            # trained model, the predictions or the predictions
+                            # and the model
+                            # default is only the model
+                            # if this variable is missing the default is used
 ```

@@ -44,11 +44,14 @@ def read_config():
     oob = config.get('oob', False)
 
     weight_classes_bool = config.get('use_weighted_classes', False)
+    output_mode = config.get('output_mode', 'model')
+    if output_mode not in ['model', 'pred', 'model+pred']:
+        raise ValueError('Output mode must be either "model" or "pred" or "model+pred".')
 
     return train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, \
             n_estimators, criterion, max_depth, min_samples_split, min_samples_leaf, \
             max_features, bootstrap, max_samples, random_state, prediction_mode, quantile, \
-            n_bins, oob, weight_classes_bool
+            n_bins, oob, weight_classes_bool, output_mode
 
 def convert_to_np(data):
     if isinstance(data, (pd.Series, pd.DataFrame)):

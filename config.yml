@@ -22,3 +22,4 @@ fc-rand-forest:
   mode: 'classification'
   n_bins: 10
   use_weighted_classes: False
+  output_mode: 'model+pred'
