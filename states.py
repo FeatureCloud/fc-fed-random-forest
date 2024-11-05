@@ -1,6 +1,6 @@
+import os
 import numpy as np
 import pandas as pd
-import os
 import joblib
 from scipy.stats import norm
 from FeatureCloud.app.engine.app import AppState, app_state, Role
@@ -18,8 +18,8 @@ class InitialState(AppState):
     def register(self):
         self.register_transition('local_binning', Role.BOTH)
 
-    def run(self) -> str or None:
-        self.update(message=f'Read files', progress=0.05)
+    def run(self) -> str or None: # type: ignore
+        self.update(message='Read files', progress=0.05)
         self.log('Read config-file...')
         train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, \
             n_estimators, criterion, max_depth, min_samples_split, min_samples_leaf, \
@@ -112,7 +112,7 @@ class LocalBinningState(AppState):
     def register(self):
         self.register_transition('aggregate_binning', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
 
         # Normalize data for quantile binning
         X = self.load('X')
@@ -152,7 +152,7 @@ class AggregateBinningState(AppState):
     def register(self):
         self.register_transition('global_binning', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         if self.is_coordinator:
             gathered_data = self.gather_data()
 
@@ -221,7 +221,7 @@ class BinningGlobalState(AppState):
     def register(self):
         self.register_transition('global_quantile_binning', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         global_mean = self.load('global_mean')
@@ -249,7 +249,7 @@ class GlobalQuantileBinningState(AppState):
     def register(self):
         self.register_transition('combine_binning', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         n_bins = self.load('n_bins')
         X = self.load('X_normalized_quantile')
         X_hist_list = []
@@ -284,7 +284,7 @@ class CombineBinningState(AppState):
     def register(self):
         self.register_transition('feat_idcs', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         bucket_idcs = np.setdiff1d(np.arange(len(X[0][0])), quantile_idcs)
@@ -334,7 +334,7 @@ class FeatureIndicesState(AppState):
     def register(self):
         self.register_transition('init_forest', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         self.log('Choose feature indices...')
 
         if self.is_coordinator:
@@ -373,7 +373,7 @@ class InitForestState(AppState):
     def register(self):
         self.register_transition('find_local_splits', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         self.log('Initialize forest...')
         mode = self.load('prediction_mode')
 
@@ -403,7 +403,7 @@ class InitForestState(AppState):
                 rf_models.append(rf_model)
 
         else:
-            raise Exception('Only classification and regression are valid modes.')
+            raise ValueError('Only classification and regression are valid modes.')
 
         self.store('rf_models', rf_models)
         self.store('depth', 0)
@@ -421,7 +421,7 @@ class LocalSplitState(AppState):
     def register(self):
         self.register_transition('aggregate_splits', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         rf_models = self.load('rf_models')
         X_hist = self.load('X_hist')
         y = self.load('y')
@@ -465,9 +465,9 @@ class AggregateSplitState(AppState):
     """
 
     def register(self):
-       self.register_transition('local_stopping_criteria', Role.BOTH)
+        self.register_transition('local_stopping_criteria', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         if self.is_coordinator:
             rf_models = self.load('rf_models')
             data = self.gather_data()
@@ -564,7 +564,7 @@ class LocalStoppingCriteria(AppState):
     def register(self):
         self.register_transition('stopping_criteria', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         rf_models = self.load('rf_models')
         stopping_criteria = []
 
@@ -599,7 +599,7 @@ class StoppingCriteria(AppState):
         self.register_transition('find_local_splits', Role.BOTH)
         self.register_transition('compute_global_leaves', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
 
         if self.is_coordinator:
             # Aggregate stopping criteria
@@ -740,7 +740,7 @@ class ComputeGlobalLeavesState(AppState):
     def register(self):
         self.register_transition('construct_global_rf', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         rf_models = self.load('rf_models')
         y = self.load('y')
         classes = self.load('classes')
@@ -788,7 +788,7 @@ class ConstructGlobalLeavesState(AppState):
         self.register_transition('calculate_local_oob', Role.BOTH)
         self.register_transition('write', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         if self.is_coordinator:
             gathered_data = self.gather_data()
             leaf_values = []
@@ -840,7 +840,7 @@ class CalculateLocalOOBState(AppState):
     def register(self):
         self.register_transition('get_global_oob', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         rf_models = self.load('rf_models')
         X_hist = self.load('X_hist')
         y = self.load('y')
@@ -868,8 +868,8 @@ class AggregateOOBState(AppState):
     def register(self):
         self.register_transition('write', Role.BOTH)
 
-    def run(self) -> str or None:
-        if is_coordinator:
+    def run(self) -> str or None: # type: ignore
+        if self.is_coordinator:
             gathered_data = self.gather_data()
             weights = []
             for split in range(len(self.load('X_hist'))):
@@ -907,7 +907,7 @@ class WriteState(AppState):
     def register(self):
         self.register_transition('terminal', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self) -> str or None: # type: ignore
         self.update(message='Writing Output')
         rf_models = self.load('rf_models')
         X_test = self.load('X_test')
@@ -917,8 +917,8 @@ class WriteState(AppState):
             df = pd.DataFrame(data=data)
             df.to_csv(path, index=False, sep=self.load('sep'))
 
-        base_dir_in = os.path.normpath(os.path.join(f'/mnt/input/', self.load('split_dir')))
-        base_dir_out = os.path.normpath(os.path.join(f'/mnt/output/', self.load('split_dir')))
+        base_dir_in = os.path.normpath(os.path.join('/mnt/input/', self.load('split_dir')))
+        base_dir_out = os.path.normpath(os.path.join('/mnt/output/', self.load('split_dir')))
 
         if self.load('split_mode') == 'directory':
             for i, split_name in enumerate(os.listdir(base_dir_in)):
