@@ -1,3 +1,4 @@
+# pylint: disable=all
 import numpy as np
 import pandas as pd
 import os
@@ -83,8 +84,8 @@ class InitialState(AppState):
         if quantile and len(quantile) > 0:
             try:
                 quantile = np.array(quantile, dtype=int)
-            except ValueError:
-                raise ValueError('Quantile indices must be integers')
+            except ValueError as e:
+                raise ValueError('Quantile indices must be integers') from e
         else:
             assert num_features is not None # to satisfy the pesky linter
             # in this case we consider all features for quantile binning
@@ -228,7 +229,8 @@ class LocalBinningState1(AppState):
             # get the per column mean of the top/bottom 5% of the values per feature
             split_data_sorted = np.sort(split_data, axis=0)
                 # sort per column (per feature)
-                # sorts ascending (fun fact: the documentation of np.sort does not contain the word ascending)
+                # sorts ascending
+                # fun fact: the documentation of np.sort does not contain the word ascending nor descending
             min_array = np.mean(split_data_sorted[:quantile5_end], axis=0)
             max_array = np.mean(split_data_sorted[quantile95_start:], axis=0)
                 # column-wise mean -> per feature mean as one vector
@@ -248,19 +250,23 @@ class LocalBinningState1(AppState):
 class GlobalBinningState1(AppState):
     """
     Calculates the global mean for quantile binning and the fixed-width bins
-    per feature.
+    per feature. Means are needed for the standard deviation calculation, which
+    is then handled by global_get_binning_params2.
+    Mean and stddev are needed for z-score normalization, which is needed for
+    quantile binning.
 
     ## Receives:
         What was sent in local_get_binning_params1
 
     ## Sends:
-        A Tuple[List[List[float]], List[np.ndarray]]:
+        A Tuple[List[List[float]], List[np.ndarray], List[np.ndarray]]:
         1. Per split the global mean values for quantile binning per feature (feature=index)
         2. Per split the global split points for fixed-width binning per feature (feature=index)
+        3. Per split the sample count for the global stddev calculation (feature=index)
     """
 
     def register(self):
-        self.register_transition('global_binning', Role.COORDINATOR)
+        self.register_transition('local_get_binning_params2', Role.COORDINATOR)
 
     def run(self):
         gathered_data = self.gather_data()
@@ -272,7 +278,12 @@ class GlobalBinningState1(AppState):
                 raise ValueError('Feature names do not match between clients')
 
         # Second we calculate the global mean for quantile binning
-        broadcast_data_quantile = []
+        broadcast_means = []
+            # splits x features, each entry being the mean for the corresponding feature
+            # globally
+        sample_counts = []
+            # splits x features, each entry being the number of samples for the corresponding feature
+            # globally
         local_matrix_list = [gathered_data[client_idx][0] for client_idx in range(len(gathered_data))]
         # Ensure the num_splits are the same over all clients
         # since send to self is true we don;t need to look at the coordinator
@@ -280,20 +291,21 @@ class GlobalBinningState1(AppState):
         splits = [len(d) for d in local_matrix_list]
         if len(set(splits)) != 1:
             raise ValueError('The number of splits differ between clients')
-        # actually calculate the global mean
+        # calculate the global mean
         for split_idx, _ in enumerate(self.load('X')):
             try:
-                data = [d[split_idx] for d in local_matrix_list]
-                # format is clients x num_features x 2
+                data = np.array([d[split_idx] for d in local_matrix_list])
+                # format is clients x num_features x 2, we removed the split
+                # axis due to the split loop
             except IndexError:
                 raise ValueError('The number of splits differ between clients')
             global_matrix = np.sum(data, axis=0)
                 # we sum over the clients axis, new format is num_features x 2
-            accumulated_sample_count = global_matrix[:, 0]
-            accumulated_sum = global_matrix[:, 1]
-            mean = accumulated_sum / accumulated_sample_count
-            broadcast_data_quantile.append(mean)
-
+            accumulated_sample_count = global_matrix[:, 0] # vector of shape num_features
+            accumulated_sum = global_matrix[:, 1] # vector of shape num_features
+            mean = accumulated_sum / accumulated_sample_count # vector of shape num_features
+            broadcast_means.append(mean)
+            sample_counts.append(accumulated_sample_count)
 
         split_points_bucket = []
             # List containing for each split, for each feature the split points
@@ -321,13 +333,16 @@ class GlobalBinningState1(AppState):
                 # n_bins + 1 as for n_bins we need n_bins + 1 split points
             split_points_bucket.append([split_points[:-1] for split_points in split_points_per_feature])
                 #TODO: why -1???
+                # maybe later we only consider > than split[i], < split[i+1]
+                # or something like that
+                # the future will tell
+                # TODO: remove the rambling
 
-        data = [broadcast_data_quantile, split_points_bucket]
+        # save the sample count for the global stddev calculation
+        data = [broadcast_means, split_points_bucket, sample_counts]
         self.broadcast_data(data, send_to_self=True)
         return 'local_get_binning_params2'
 
-
-# TODO: implement this correctly!
 @app_state('local_get_binning_params2', Role.PARTICIPANT)
 class LocalBinningState2(AppState):
     """
@@ -335,55 +350,154 @@ class LocalBinningState2(AppState):
     and the split points for fixed-width binning.
 
     ### Receives:
-        A Tuple[np.ndarray, np.ndarray]:
-        1. Global mean and standard deviation for quantile binning
-        2. Split points for fixed-width binning
+        What global_get_binning_params1 sends
 
     ### Sends:
-        nothing, saves the received data in self.store
+        A list of dimensions splits x features_quantile with each entry being the
+        local standard deviation for the corresponding feature.
     """
 
     def register(self):
-        self.register_transition('global_binning', Role.BOTH)
+        self.register_transition('local_calc_bins_normalize', Role.PARTICIPANT)
+        self.register_transition('aggregate_stddev', Role.COORDINATOR)
 
     def run(self):
-        data = self.await_data()
+        means, splitpoints, sample_counts = tuple(self.await_data())
+            # means is splits x features_quantile
+            # splitpoints is splits x features_non_quantile x n_bins TODO: (+1/-1?)
+            # sample_counts is splits x features_quantile
+        means = np.array(means)
+        splitpoints = np.array(splitpoints)
+        sample_counts = np.array(sample_counts)
+        self.store('split_points_bucket', splitpoints)
 
-        global_mean = [d[0] for d in data[0]]
-        global_stddev = [d[1] for d in data[0]]
-        self.store('global_mean', global_mean)
-        self.store('global_stddev', global_stddev)
-
+        # now that we have the global means we can calculate the local
+        # std deviation for quantile binning and sent it to the coordinator for
+        # the global stddev calculation
         X = self.load('X')
-        bucket_idcs = np.setdiff1d(np.arange(len(X[0][0])), self.load('quantile'))
-        tmp_split_points = []
-        tmp_X_hist = []
+        quantile_idcs = self.load('quantile')
+        stddevs = []
+            # format is splits x num_features_quantile
+            # each entry is the standard deviation for the corresponding feature
+            # and split
+            # Caveat: we don't send exactly the standard deviation but the sum of
+            # (x_i - mean)^2
+            # The global client still has the sample count from before
+        for split_idx, _ in enumerate(X):
+            X_quantile = X[split_idx][:, quantile_idcs]
+                # samples x features_quantile
 
-        for split in range(len(X)):
-            split_points = np.array(data[1][split])
-            tmp_split_points.append(split_points)
-            X_T = np.transpose(X[split][:, bucket_idcs])
-            # Assign data points to bins
-            X_hist = np.array([np.digitize(X_T[i], split_points[i]) \
-                                    for i in range(X_T.shape[0])]) - 1
-            tmp_X_hist.append(X_hist)
+            # formula stddev is sqrt(sum(x_i - mean)^2 / num_samples)
+            local_stddev = np.sum(((X_quantile - means[split_idx]) ** 2) / sample_counts[split_idx], axis=0)
+                # X_quantile is samples x features_quantile, means[split_idx]
+                # and sample_counts[split_idx] are vectors of shape features_quantile
+                # broadcasting applies means and sample_counts row-wise (sample axis)
+                # np.sum is used to collapse the samples axis
+                # final shape becomes features_quantile vector
+            stddevs.append(local_stddev)
+                # stddevs gets shape splits x features_quantile with each
+                # entry being the local stddev for the corresponding feature
 
-        self.store('split_points_bucket', tmp_split_points)
-        self.store('X_hist_bucket', tmp_X_hist)
+        # save the means already so we don't need to broadcast them again later
+        self.store('global_mean', means)
+        self.store('sample_count', sample_counts)
 
-        return 'global_binning'
+        # send the local stddev to the coordinator, which can then finish
+        # the global stddev calculation
+        # and therefore finish the prepataion z-score normalization
+        self.send_data_to_coordinator(stddevs)
+        if self.is_coordinator:
+            return 'aggregate_stddev'
+        else:
+            return 'local_calc_bins_normalize'
 
+@app_state('aggregate_stddev', Role.COORDINATOR)
+class AggregateStddevState(AppState):
+    """
+    Aggregates the local standard deviations and calculates the global
+    standard deviation per feature for quantile binning.
+    Collapses the received clients x splits x features_quantile
+    to splits x features_quantile, using the sample counts from the
+    previous step (global_get_binning_params1).
 
-@app_state('global_binning', Role.BOTH)
+    ### Receives:
+        What local_get_binning_params2 sends
+    ### Sends:
+        A list of dimensions splits x features_quantile with each entry being the
+        global standard deviation for the corresponding feature.
+    """
+
+    def register(self):
+        self.register_transition('local_calc_bins_normalize', Role.COORDINATOR)
+
+    def run(self):
+        stddevs = self.gather_data()
+            # stddevs is clients x splits x features_quantile
+        # we need to collapse the clients axis to get splits x features_quantile
+        global_stddevs = []
+        for split_idx, _ in enumerate(self.load('X')):
+            try:
+                data = np.array([d[split_idx] for d in stddevs])
+                # format is clients x features_quantile
+            except IndexError:
+                raise ValueError('The number of splits differ between clients')
+            global_stddev_split = np.sum(data, axis=0)
+                # collapse the clients axis, clients x features_quantile -> features_quantile
+            global_stddevs.append(global_stddev_split)
+                # global_stddevs is splits x features_quantile
+
+        self.broadcast_data(global_stddevs, send_to_self=True)
+        return 'local_calc_bins_normalize'
+
+#TODO: fix this one!
+@app_state('local_calc_bins_normalize', Role.BOTH)
 class BinningGlobalState(AppState):
     """
-    Normalize data.
+    Z-score normalizaes data to be able to do quantile binning.
+
+    ### Receives:
+        What aggregate_stddev sends
+
+    ### Sends:
+        Nothing, saves the z-score normalized data so that
+        global_quantile_binning can continue with the quantile binning.
     """
 
     def register(self):
         self.register_transition('global_quantile_binning', Role.BOTH)
 
     def run(self):
+        global_stddev = self.await_data()
+            # global_stddevs is splits x features_quantile
+        self.store('global_stddev', global_stddev)
+        global_mean = self.load('global_mean')
+        split_points_bucket = self.load('split_points_bucket')
+            # split_bucket is splits x features_non_quantile x n_bins
+        # TODO: OLD CODE, what do with this? maybe still necessary -> CHECK
+        # This was previously done by both participants and coordinator
+        # right before global_binning
+        # global_binning was renamed to local_calc_bins_normalize
+        # Probably should be here and should be done by participant and coordinator
+
+        X = self.load('X')
+        bucket_idcs = np.setdiff1d(np.arange(len(X[0][0])), self.load('quantile'))
+        tmp_X_hist = []
+
+        for split in range(len(X)):
+            split_points = np.array(split_points_bucket[split])
+                # split_points is features_non_quantile x n_bins
+            X_T = np.transpose(X[split][:, bucket_idcs])
+                # X_T is features_non_quantile x samples
+            # Assign data points to bins
+            X_hist = np.array([np.digitize(X_T[i], split_points[i]) \
+                                    for i in range(X_T.shape[0])]) - 1
+            tmp_X_hist.append(X_hist)
+
+        self.store('X_hist_bucket', tmp_X_hist)
+
+        #TODO: end of old code.
+        #TODO: start of original global binning code
+
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         global_mean = self.load('global_mean')
