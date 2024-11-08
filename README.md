@@ -3,6 +3,7 @@
 ## Description
 A Random Forest FeautureCloud app, allowing an iterative federated computation of the random forest algorithm.
 Supports single-class classification. The multiclass classification and regression are to be added. 
+Does not support missing data.
 
 ## Input
 - train.csv containing the local training data (columns: features; rows: samples)
@@ -54,7 +55,9 @@ fc_random_forest:
   max_samples: 0.75 # number of samples to draw from X to train each base estimator
   bootstrap: True # whether bootstrap samples are used when building trees
   n_bins: 10 # number of bins used for each feature
-  quantile: 0,1 # feature indices for quantile binning
+  quantile: [0,1] # The feature indices to use for quantile binning. 
+                # If this is not given or an empty array is given, 
+                # quantile binning is used on all features
   random_state: 42 # random state for reproducibility
   oob: True # use out-of-bag error to weight decision trees
   use_weighted_classes: False # if set to True, all classes are given the same 

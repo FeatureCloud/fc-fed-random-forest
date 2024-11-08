@@ -1,16 +1,16 @@
 fc-rand-forest:
   input:
-    - train: 'train.csv'
-    - test: 'test.csv'
+    train: 'train.csv'
+    test: 'test.csv'
   output:
-    - pred: 'pred.csv'
-    - test: 'test.csv'
+    pred: 'pred.csv'
+    test: 'test.csv'
   format:
-    - sep: ','
-    - label_col: 'target'
+    sep: ','
+    label_col: 'target'
   split:
-    - mode: 'file'
-    - dir: .
+    mode: 'file'
+    dir: .
   n_estimators: 100
   max_depth: 10
   min_samples_split: 2

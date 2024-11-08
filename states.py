@@ -8,51 +8,88 @@ from helper.io import read_config, read_files
 from helper.util import validate_input_data
 from RandomForest.models import RandomForest, Node
 from RandomForest.splitting import split_score
+from typing import Union
+from copy import deepcopy
 
-
+# if missing values want to be supported, check the MISSING_VALUES_SUPPORT comments
+# here and in the called classes/functions
 @app_state('initial', Role.BOTH)
 class InitialState(AppState):
     """
-    Read config file and input data.
+    Read config file and input data, also validating the input
+
+    ### Receives:
+        nothing
+
+    ### Sends:
+        nothing, saves relevant input in self.store
     """
 
     def register(self):
-        self.register_transition('local_binning', Role.BOTH)
+        self.register_transition('local_get_binning_params1', Role.BOTH)
 
-    def run(self) -> str or None:
-        self.update(message=f'Read files', progress=0.05)
+    def run(self):
+        self.update(message='Read files', progress=0.05)
         self.log('Read config-file...')
         train, test_input, pred, test_output, sep, label_col, split_mode, split_dir, \
             n_estimators, criterion, max_depth, min_samples_split, min_samples_leaf, \
             max_features, bootstrap, max_samples, random_state, prediction_mode, quantile, \
             n_bins, oob, weight_classes_bool, output_mode = read_config()
-
+        self.log("The following parameters were read from the config file:")
+        self.log(f"Train: {train}; Test: {test_input}; Prediction: {pred}; Test output: {test_output}; " +\
+                 f"Separator: {sep}; Label column: {label_col}; Split mode: {split_mode}; Split directory: {split_dir}; " +\
+                 f"Number of estimators: {n_estimators}; Criterion: {criterion}; Max depth: {max_depth}; " +\
+                 f"Min samples split: {min_samples_split}; Min samples leaf: {min_samples_leaf}; " +\
+                 f"Max features: {max_features}; Bootstrap: {bootstrap}; Max samples: {max_samples}; " +\
+                 f"Random state: {random_state}; Prediction mode: {prediction_mode}; Quantile: {quantile}; " +\
+                 f"Number of bins: {n_bins}; Out of bag: {oob}; Weight classes: {weight_classes_bool}; " +\
+                 f"Output mode: {output_mode}")
         self.log('Read data...')
         X, y, X_test, y_test = [], [], [], []
-        if len(quantile) > 0:
-            if ',' in quantile:
-                quantile = np.fromstring(quantile, dtype=int, sep=',')
-            else:
-                quantile = np.array([int(quantile)])
-        else:
-            quantile = np.empty(0, dtype=int)
 
         if split_mode == 'directory':
+            num_features = None
+            feature_names = None
+            # multiple datasets as input from crossvalidation
             for split_name in os.listdir('/mnt/input/' + split_dir):
-                X_, y_, X_test_, y_test_ = read_files(os.path.join(split_dir, split_name, \
+                # Take each folder in the split_dir as it's own dataset
+                X_, y_, X_test_, y_test_, feature_names_split = read_files(os.path.join(split_dir, split_name, \
                      train), os.path.join(split_dir, split_name, test_input), sep, label_col)
-                validate_input_data(X_, y_, X_test_, y_test_)
+                if num_features is None:
+                    num_features = X_.shape[1]
+                if feature_names is None:
+                    feature_names = deepcopy(feature_names_split)
+                        # we need to deepcpy or else featurenames is just
+                        # a pointer to a pointer that get's changed every loop....
+                elif feature_names != feature_names_split:
+                    raise ValueError('Feature names do not match between datasets')
+                validate_input_data(X_, y_, X_test_, y_test_, num_features)
                 X.append(X_)
                 y.append(y_)
                 X_test.append(X_test_)
                 y_test.append(y_test_)
+            self.store('feature_names', feature_names)
         else:
-            X_, y_, X_test_, y_test_ = read_files(train, test_input, sep, label_col)
-            validate_input_data(X_, y_, X_test_, y_test_)
+            # otherwise just a single dataset
+            X_, y_, X_test_, y_test_, feature_names_ = read_files(train, test_input, sep, label_col)
+            num_features = X_.shape[1]
+            validate_input_data(X_, y_, X_test_, y_test_, num_features)
             X.append(X_)
             y.append(y_)
             X_test.append(X_test_)
             y_test.append(y_test_)
+            self.store('feature_names', feature_names_)
+
+        if quantile and len(quantile) > 0:
+            try:
+                quantile = np.array(quantile, dtype=int)
+            except ValueError:
+                raise ValueError('Quantile indices must be integers')
+        else:
+            assert num_features is not None # to satisfy the pesky linter
+            # in this case we consider all features for quantile binning
+            quantile = np.arange(num_features)
+
 
         np.random.seed(random_state)
 
@@ -98,93 +135,219 @@ class InitialState(AppState):
         self.store('n_features', X[0].shape[1])
         self.store('depth', 0)
 
-        return 'local_binning'
+        return 'local_get_binning_params1'
 
 
-@app_state('local_binning', Role.BOTH)
-class LocalBinningState(AppState):
+@app_state('local_get_binning_params1', Role.BOTH)
+class LocalBinningState1(AppState):
     """
-    Calculate values for z-score normalization and determine local minima and maxima
-    for bucket binning and send these values to the coordinator.
+    We perform two ways two find bins for which we calculate split points later:
+    1. quantile binning: we z-normalize the data and can then based on
+        the z-normalized data calculate the bins in a way that the bins
+        contain the same number of samples
+    2. fixed-width binning: we calculate the minimum and maximum values for each feature
+        and bin with fixed-width bins between min and max
+        For privacy reasons, we don't use the actual min/max but the mean of the
+        top/bottom 5% of the values
+    For the two ways to bin, quantile binning and fixed-width binning, we need
+    to calculate:
+    - fixed-width binning: the minimum and maximum values for each feature
+    - quantile binning: the mean and standard deviation for each feature, which
+        is used to normalize the data via z-score normalization
+        The mean is easy and can be calculated by summing up all values and dividing
+        by the sum of the number of samples.
+        However, consider the formula for the standard deviation:
+        stddev = sqrt(sum(x_i - mean)^2 / num_samples)
+        To calculate this, we need to have the mean calculated first.
+
+    Therefore, we first send around only the sum of values to calculate the mean
+    and get the z-score normalized data and the quantile bins in a second step (get_binning_params2)
+
+    ### Receives:
+        nothing
+
+    ### Sends:
+        A Tuple[List[np.ndarray], List[np.ndarray], List[str]]:
+        1. Information for quantile binning: List of matrices with two columns,
+            each row_idx is a feature_idx, first column is the sum of values,
+            second the number of values
+        2. Information for fixed-width binning: List of matrices with two columns,
+            each row_idx is a feature_idx, first column is the minimum value,
+            second the maximum value
+        3. List of feature names to ensure that all clients have the same features
+            in the same order, else the model would not work at all
     """
 
     def register(self):
-        self.register_transition('aggregate_binning', Role.BOTH)
+        self.register_transition('global_get_binning_params1', Role.COORDINATOR)
+        self.register_transition('local_get_binning_params2', Role.PARTICIPANT)
 
-    def run(self) -> str or None:
+    def run(self) -> Union[str, None]:
 
         # Normalize data for quantile binning
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         local_matrix_list = []
-        for split in range(len(X)):
-            X_quantile = X[split][:, quantile_idcs]
-            local_matrix = np.zeros((X_quantile.shape[1], 3))
-            local_matrix[:, 0] = X_quantile.shape[0]
-            local_matrix[:, 1] = np.sum(np.square(X_quantile), axis=0)
-            local_matrix[:, 2] = np.sum(X_quantile, axis=0)
+            # List containing for each split a matrix
+            # with num_features_quantile rows and with twp columns:
+            # 1. Number of samples
+            # 2. Sum of values per feature in the quantile_features
+            # This is needed to calculate the mean per feature
+        for split_idx, _ in enumerate(X):
+            X_quantile = X[split_idx][:, quantile_idcs]
+            num_features_quantile = X_quantile.shape[1]
+            local_matrix = np.zeros((num_features_quantile, 2))
+            # if num_features_quantile = 0, these will have no effect
+            # as there is no row to fill
+            local_matrix[:, 0] = X_quantile.shape[0] # num_rows = num_samples
+                # MISSING_VALUES_SUPPORT: don't use shape, get count without missing values
+            local_matrix[:, 1] = np.sum(X_quantile, axis=0) # column-wise sum -> per feature sum as one vector
             local_matrix_list.append(local_matrix)
 
         # Get minimum and maximum for bucket binning
         send_data_bucket = []
-        bucket_idcs = np.setdiff1d(np.arange(len(X[0][0])), quantile_idcs)
+            # List containing for each split a matrix with two columns:
+            # 1. Minimum values per feature in the bucket_features
+            # 2. Maximum values per feature in the bucket_features
+        num_features = len(X[0][0])
+        bucket_idcs = np.setdiff1d(np.arange(num_features), quantile_idcs)
+            # For bucket binning we consider all features that are not
+            # used in quantile binning
 
-        for split in range(len(X)):
-            min_array = np.min(X[split][:, bucket_idcs], axis=0)
-            max_array = np.max(X[split][:, bucket_idcs], axis=0)
+        for split_idx, _ in enumerate(X):
+            # get split specific data
+            split_data = X[split_idx][:, bucket_idcs]
+                # samples x features
+            num_samples_total = split_data.shape[0]
+            quantile5_end = int(num_samples_total * 0.05)
+                # the last value to consider in a sorted array for the 5% quantile
+            quantile95_start = int(num_samples_total * 0.95)
+                # the first value to consider in a sorted array for the 95% quantile
+            # MISSING_VALUES_SUPPORT: use the correct num_samples here as this changes per feature
+
+            # get the per column mean of the top/bottom 5% of the values per feature
+            split_data_sorted = np.sort(split_data, axis=0)
+                # sort per column (per feature)
+                # sorts ascending (fun fact: the documentation of np.sort does not contain the word ascending)
+            min_array = np.mean(split_data_sorted[:quantile5_end], axis=0)
+            max_array = np.mean(split_data_sorted[quantile95_start:], axis=0)
+                # column-wise mean -> per feature mean as one vector
             send_data_bucket.append(np.array([min_array, max_array]))
 
-        self.send_data_to_coordinator([local_matrix_list, send_data_bucket])
+        # Lastly, we also send the feature names around to ensure that
+        # all clients have the same features in the same order
+        self.send_data_to_coordinator([local_matrix_list, send_data_bucket, self.load('feature_names')])
+        if self.is_coordinator:
+            return 'global_get_binning_params1'
+        else:
+            return 'local_get_binning_params2'
 
-        return 'aggregate_binning'
 
 
-
-@app_state('aggregate_binning', Role.BOTH)
-class AggregateBinningState(AppState):
-
+@app_state('global_get_binning_params1', Role.COORDINATOR)
+class GlobalBinningState1(AppState):
     """
-    Aggregate data for federated z-score normalization and calculate global minima and maxima
-    for bucket binning.
+    Calculates the global mean for quantile binning and the fixed-width bins
+    per feature.
+
+    ## Receives:
+        What was sent in local_get_binning_params1
+
+    ## Sends:
+        A Tuple[List[List[float]], List[np.ndarray]]:
+        1. Per split the global mean values for quantile binning per feature (feature=index)
+        2. Per split the global split points for fixed-width binning per feature (feature=index)
+    """
+
+    def register(self):
+        self.register_transition('global_binning', Role.COORDINATOR)
+
+    def run(self):
+        gathered_data = self.gather_data()
+        # First we use the feature names and ensure that all clients have the same features
+        # in the same order
+        feature_names = gathered_data[0][2]
+        for feature_names_other in gathered_data[1:]:
+            if feature_names != feature_names_other:
+                raise ValueError('Feature names do not match between clients')
+
+        # Second we calculate the global mean for quantile binning
+        broadcast_data_quantile = []
+        local_matrix_list = [gathered_data[client_idx][0] for client_idx in range(len(gathered_data))]
+        # Ensure the num_splits are the same over all clients
+        # since send to self is true we don;t need to look at the coordinator
+        # seperately
+        splits = [len(d) for d in local_matrix_list]
+        if len(set(splits)) != 1:
+            raise ValueError('The number of splits differ between clients')
+        # actually calculate the global mean
+        for split_idx, _ in enumerate(self.load('X')):
+            try:
+                data = [d[split_idx] for d in local_matrix_list]
+                # format is clients x num_features x 2
+            except IndexError:
+                raise ValueError('The number of splits differ between clients')
+            global_matrix = np.sum(data, axis=0)
+                # we sum over the clients axis, new format is num_features x 2
+            accumulated_sample_count = global_matrix[:, 0]
+            accumulated_sum = global_matrix[:, 1]
+            mean = accumulated_sum / accumulated_sample_count
+            broadcast_data_quantile.append(mean)
+
+
+        split_points_bucket = []
+            # List containing for each split, for each feature the split points
+            # dimensions is therefore splits x features x n_bins
+            # List[List[np.ndarray(1d vector)]]
+        n_bins = self.load('n_bins')
+        data_bucket = [gathered_data[i][1] for i in range(len(gathered_data))]
+            # format of data_bucket is clients x splits x 2 x num_features
+            # for the two columns: first is min, second is max
+
+        for split_idx, _ in enumerate(self.load('X')):
+            data = [d[split_idx] for d in data_bucket]
+                # we only consider this specific split
+                # format of data is clients x 2 x num_features
+            min_max_values = np.array(data)
+                # np.array of shape clients x 2 x num_features
+            min_values_all = min_max_values[:, 0, :]
+            max_values_all = min_max_values[:, 1, :]
+                # shape clients x num_features
+            min_values = np.min(min_values_all, axis=0)
+            max_values = np.max(max_values_all, axis=0)
+                # reduce via min/max from clients x num_features to num_features, finding the min over all clients
+            split_points_per_feature = [np.linspace(float(min_values[feature_idx]), float(max_values[feature_idx]), \
+                n_bins + 1) for feature_idx in range(len(min_values))]
+                # n_bins + 1 as for n_bins we need n_bins + 1 split points
+            split_points_bucket.append([split_points[:-1] for split_points in split_points_per_feature])
+                #TODO: why -1???
+
+        data = [broadcast_data_quantile, split_points_bucket]
+        self.broadcast_data(data, send_to_self=True)
+        return 'local_get_binning_params2'
+
+
+# TODO: implement this correctly!
+@app_state('local_get_binning_params2', Role.PARTICIPANT)
+class LocalBinningState2(AppState):
+    """
+    Receives the global mean and standard deviation for quantile binning
+    and the split points for fixed-width binning.
+
+    ### Receives:
+        A Tuple[np.ndarray, np.ndarray]:
+        1. Global mean and standard deviation for quantile binning
+        2. Split points for fixed-width binning
+
+    ### Sends:
+        nothing, saves the received data in self.store
     """
 
     def register(self):
         self.register_transition('global_binning', Role.BOTH)
 
-    def run(self) -> str or None:
-        if self.is_coordinator:
-            gathered_data = self.gather_data()
-
-            broadcast_data_quantile = []
-            local_matrix_list = [gathered_data[i][0] for i in range(len(gathered_data))]
-            for split in range(len(self.load('X'))):
-                data = [d[split] for d in local_matrix_list]
-                global_matrix = np.sum(data, axis=0)
-                mean_square = global_matrix[:, 1] / global_matrix[:, 0]
-                mean = global_matrix[:, 2] / global_matrix[:, 0]
-                stddev = np.sqrt(mean_square - np.square(mean))
-                broadcast_data_quantile.append(np.array([mean, stddev]))
-
-            split_points_bucket = []
-            n_bins = self.load('n_bins')
-            data_bucket = [gathered_data[i][1] for i in range(len(gathered_data))]
-
-            for split in range(len(self.load('X'))):
-                data = [d[split] for d in data_bucket]
-                min_max_values = np.array(data)
-                min_values = np.minimum.reduce(min_max_values[:, 0])
-                max_values = np.maximum.reduce(min_max_values[:, 1])
-                bins = [np.linspace(float(min_values[i]), float(max_values[i]), \
-                    n_bins + 1) for i in range(len(min_values))]
-
-
-                split_points_bucket.append([b[:-1] for b in bins])
-
-            data = [broadcast_data_quantile, split_points_bucket]
-            self.broadcast_data(data, send_to_self=False)
-
-        else:
-            data = self.await_data()
+    def run(self):
+        data = self.await_data()
 
         global_mean = [d[0] for d in data[0]]
         global_stddev = [d[1] for d in data[0]]
@@ -220,12 +383,13 @@ class BinningGlobalState(AppState):
     def register(self):
         self.register_transition('global_quantile_binning', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         global_mean = self.load('global_mean')
         global_stddev = self.load('global_stddev')
-        X_normalized = []
+        X_normalized = 11
+
         for split in range(len(X)):
             a = (X[split][:, quantile_idcs] - global_mean[split])
             b = global_stddev[split]
@@ -248,7 +412,7 @@ class GlobalQuantileBinningState(AppState):
     def register(self):
         self.register_transition('combine_binning', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         n_bins = self.load('n_bins')
         X = self.load('X_normalized_quantile')
         X_hist_list = []
@@ -283,7 +447,7 @@ class CombineBinningState(AppState):
     def register(self):
         self.register_transition('feat_idcs', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         bucket_idcs = np.setdiff1d(np.arange(len(X[0][0])), quantile_idcs)
@@ -352,7 +516,7 @@ class FeatureIndicesState(AppState):
     def register(self):
         self.register_transition('init_forest', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         self.log('Choose feature indices...')
 
         if self.is_coordinator:
@@ -434,7 +598,7 @@ class InitForestState(AppState):
     def register(self):
         self.register_transition('find_local_splits', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         self.log('Initialize forest...')
         mode = self.load('prediction_mode')
 
@@ -464,7 +628,7 @@ class InitForestState(AppState):
                 rf_models.append(rf_model)
 
         else:
-            raise Exception('Only classification and regression are valid modes.')
+            raise AttributeError('Only classification and regression are valid modes.')
 
         self.store('rf_models', rf_models)
         self.store('depth', 0)
@@ -482,7 +646,7 @@ class LocalSplitState(AppState):
     def register(self):
         self.register_transition('aggregate_splits', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         rf_models = self.load('rf_models')
         X_hist = self.load('X_hist')
         y = self.load('y')
@@ -529,7 +693,7 @@ class AggregateSplitState(AppState):
     def register(self):
        self.register_transition('local_stopping_criteria', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         if self.is_coordinator:
             rf_models = self.load('rf_models')
             data = self.gather_data()
@@ -626,7 +790,7 @@ class LocalStoppingCriteria(AppState):
     def register(self):
         self.register_transition('stopping_criteria', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         rf_models = self.load('rf_models')
         stopping_criteria = []
 
@@ -661,7 +825,7 @@ class StoppingCriteria(AppState):
         self.register_transition('find_local_splits', Role.BOTH)
         self.register_transition('compute_global_leaves', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
 
         if self.is_coordinator:
             # Aggregate stopping criteria
@@ -802,7 +966,7 @@ class ComputeGlobalLeavesState(AppState):
     def register(self):
         self.register_transition('construct_global_rf', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         rf_models = self.load('rf_models')
         y = self.load('y')
         classes = self.load('classes')
@@ -850,7 +1014,7 @@ class ConstructGlobalLeavesState(AppState):
         self.register_transition('calculate_local_oob', Role.BOTH)
         self.register_transition('write', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         if self.is_coordinator:
             gathered_data = self.gather_data()
             leaf_values = []
@@ -902,7 +1066,7 @@ class CalculateLocalOOBState(AppState):
     def register(self):
         self.register_transition('get_global_oob', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         rf_models = self.load('rf_models')
         X_hist = self.load('X_hist')
         y = self.load('y')
@@ -930,8 +1094,8 @@ class AggregateOOBState(AppState):
     def register(self):
         self.register_transition('write', Role.BOTH)
 
-    def run(self) -> str or None:
-        if is_coordinator:
+    def run(self):
+        if self.is_coordinator:
             gathered_data = self.gather_data()
             weights = []
             for split in range(len(self.load('X_hist'))):
@@ -969,7 +1133,7 @@ class WriteState(AppState):
     def register(self):
         self.register_transition('terminal', Role.BOTH)
 
-    def run(self) -> str or None:
+    def run(self):
         self.update(message='Writing Output')
         rf_models = self.load('rf_models')
         X_test = self.load('X_test')
@@ -980,8 +1144,8 @@ class WriteState(AppState):
             df = pd.DataFrame(data=data)
             df.to_csv(path, index=False, sep=self.load('sep'))
 
-        base_dir_in = os.path.normpath(os.path.join(f'/mnt/input/', self.load('split_dir')))
-        base_dir_out = os.path.normpath(os.path.join(f'/mnt/output/', self.load('split_dir')))
+        base_dir_in = os.path.normpath(os.path.join('/mnt/input/', self.load('split_dir')))
+        base_dir_out = os.path.normpath(os.path.join('/mnt/output/', self.load('split_dir')))
 
         if self.load('split_mode') == 'directory':
             for i, split_name in enumerate(os.listdir(base_dir_in)):
