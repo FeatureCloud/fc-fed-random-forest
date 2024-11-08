@@ -499,11 +499,15 @@ class LocalSplitState(AppState):
                         depth_nodes = decision_tree.cur_depth_nodes
                         for node in depth_nodes:
                             if not node.local_leaf:
+                                weights = None
+                                if self.load('weight_classes_bool'):
+                                    weights = self.load('weights')[split]
+
                                 local_split_score = split_score(X_hist[split][node.samples], \
                                                 y[split][node.samples], decision_tree.feat_idcs, \
                                                 n_bins, self.load('prediction_mode'), \
                                                 classes=self.load('classes'), \
-                                                weights=self.load('weights')[split])
+                                                weights=weights)
                             else:
                                 local_split_score = [[0] * n_bins for _ in \
                                                      range(len(decision_tree.feat_idcs))]
