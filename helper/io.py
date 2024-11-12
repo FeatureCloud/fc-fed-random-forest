@@ -62,7 +62,7 @@ def convert_to_np(data):
         raise ValueError("Input data is not a Pandas Series or DataFrame.")
 
 def read_files(train: str, test_input: str, sep: str, label_col: str) \
-        -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.Index[str]]:
+        -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.Index]:
     """
     Reads the train and test data files and returns the data as numpy arrays.
     Ensures that the feature names in the train and test data match, if not
@@ -94,7 +94,10 @@ def read_files(train: str, test_input: str, sep: str, label_col: str) \
     if X_test.isnull().values.any() or y_test.isnull().any():
         raise ValueError("Missing values in test data.")
     feature_names = X_train.columns
-    if feature_names != X_test.columns:
+    if feature_names.equals(X_test.columns):
+        print("Feature names in train and test data match.")
+        print(f"Features just in train data: {set(X_train.columns) - set(X_test.columns)}")
+        print(f"Features just in test data: {set(X_test.columns) - set(X_train.columns)}")
         raise ValueError("Feature names in train and test data do not match.")
     # MISSING_VALUES_SUPPORT: remove columns without ANY values, also
     # remove them from feature_names

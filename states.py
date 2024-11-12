@@ -343,7 +343,7 @@ class GlobalBinningState1(AppState):
         self.broadcast_data(data, send_to_self=True)
         return 'local_get_binning_params2'
 
-@app_state('local_get_binning_params2', Role.PARTICIPANT)
+@app_state('local_get_binning_params2', Role.BOTH)
 class LocalBinningState2(AppState):
     """
     Receives the global mean and standard deviation for quantile binning
@@ -500,9 +500,7 @@ class BinningGlobalState(AppState):
 
         X = self.load('X')
         quantile_idcs = self.load('quantile')
-        global_mean = self.load('global_mean')
-        global_stddev = self.load('global_stddev')
-        X_normalized = 11
+        X_normalized = []
 
         for split in range(len(X)):
             a = (X[split][:, quantile_idcs] - global_mean[split])
