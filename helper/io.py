@@ -94,8 +94,9 @@ def read_files(train: str, test_input: str, sep: str, label_col: str) \
     if X_test.isnull().values.any() or y_test.isnull().any():
         raise ValueError("Missing values in test data.")
     feature_names = X_train.columns
-    if feature_names.equals(X_test.columns):
+    if not feature_names.equals(X_test.columns):
         print("Feature names in train and test data match.")
+        print(f"Features train,test:\n{X_train.columns}\n{X_test.columns}")
         print(f"Features just in train data: {set(X_train.columns) - set(X_test.columns)}")
         print(f"Features just in test data: {set(X_test.columns) - set(X_train.columns)}")
         raise ValueError("Feature names in train and test data do not match.")

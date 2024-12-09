@@ -91,8 +91,27 @@ class InitialState(AppState):
             # in this case we consider all features for quantile binning
             quantile = np.arange(num_features)
 
+        # calculate the num_features and max_features
+        n_features = X[0].shape[1]
+        if max_features == 'sqrt':
+            max_features = int(np.sqrt(n_features))
+        elif max_features < 1:
+            max_features = int(n_features * max_features)
+        else:
+            try:
+                max_features = int(max_features)
+            except ValueError as e:
+                raise ValueError('Max features must be a float between 0 and 1, an integer or "sqrt"') from e
+        self.store('max_features', max_features)
+        self.store('n_features', n_features)
 
         np.random.seed(random_state)
+        try:
+            n_bins = int(n_bins)
+        except ValueError as e:
+            raise ValueError('Number of bins must be an integer') from e
+        if n_bins < 2:
+            raise ValueError('Number of bins must be at least 2')
 
         # Store parameters from config file
         self.store('pred', pred)
@@ -132,8 +151,6 @@ class InitialState(AppState):
         self.store('X_test', X_test)
         self.store('y_test', y_test)
         self.store('classes', np.unique(y[0]))
-
-        self.store('n_features', X[0].shape[1])
         self.store('depth', 0)
 
         return 'local_get_binning_params1'
@@ -272,9 +289,14 @@ class GlobalBinningState1(AppState):
         gathered_data = self.gather_data()
         # First we use the feature names and ensure that all clients have the same features
         # in the same order
-        feature_names = gathered_data[0][2]
+        feature_names = pd.Index(gathered_data[0][2])
         for feature_names_other in gathered_data[1:]:
-            if feature_names != feature_names_other:
+            feature_names_other = pd.Index(feature_names_other[2])
+            if feature_names.equals(feature_names_other):
+                print("Feature names don't match between clients.")
+                print(f"Features client0,otherclient:\n{feature_names}\n{feature_names_other}")
+                print(f"Features just in client0: {set(feature_names) - set(feature_names_other)}")
+                print(f"Features just in other client: {set(feature_names_other) - set(feature_names)}")
                 raise ValueError('Feature names do not match between clients')
 
         # Second we calculate the global mean for quantile binning
@@ -309,6 +331,7 @@ class GlobalBinningState1(AppState):
 
         split_points_bucket = []
             # List containing for each split, for each feature the split points
+            # for fixed-width binning
             # dimensions is therefore splits x features x n_bins
             # List[List[np.ndarray(1d vector)]]
         n_bins = self.load('n_bins')
@@ -331,12 +354,10 @@ class GlobalBinningState1(AppState):
             split_points_per_feature = [np.linspace(float(min_values[feature_idx]), float(max_values[feature_idx]), \
                 n_bins + 1) for feature_idx in range(len(min_values))]
                 # n_bins + 1 as for n_bins we need n_bins + 1 split points
-            split_points_bucket.append([split_points[:-1] for split_points in split_points_per_feature])
-                #TODO: why -1???
-                # maybe later we only consider > than split[i], < split[i+1]
-                # or something like that
-                # the future will tell
-                # TODO: remove the rambling
+                # 2 bins -> min, 1, max needed as split points
+                # np.linspace includes the start and stop value
+            split_points_bucket.append([split_points[1:-1] for split_points in split_points_per_feature])
+                # We neither need min nor max due to how np.digitize works
 
         # save the sample count for the global stddev calculation
         data = [broadcast_means, split_points_bucket, sample_counts]
@@ -364,7 +385,7 @@ class LocalBinningState2(AppState):
     def run(self):
         means, splitpoints, sample_counts = tuple(self.await_data())
             # means is splits x features_quantile
-            # splitpoints is splits x features_non_quantile x n_bins TODO: (+1/-1?)
+            # splitpoints is splits x features_non_quantile x (n_bins-1)
             # sample_counts is splits x features_quantile
         means = np.array(means)
         splitpoints = np.array(splitpoints)
@@ -386,7 +407,8 @@ class LocalBinningState2(AppState):
         for split_idx, _ in enumerate(X):
             X_quantile = X[split_idx][:, quantile_idcs]
                 # samples x features_quantile
-
+                # Extract only the features that are used for quantile binning
+                # from the raw data
             # formula stddev is sqrt(sum(x_i - mean)^2 / num_samples)
             local_stddev = np.sum(((X_quantile - means[split_idx]) ** 2) / sample_counts[split_idx], axis=0)
                 # X_quantile is samples x features_quantile, means[split_idx]
@@ -449,11 +471,11 @@ class AggregateStddevState(AppState):
         self.broadcast_data(global_stddevs, send_to_self=True)
         return 'local_calc_bins_normalize'
 
-#TODO: fix this one!
 @app_state('local_calc_bins_normalize', Role.BOTH)
 class BinningGlobalState(AppState):
     """
     Z-score normalizaes data to be able to do quantile binning.
+    Also creates the fixed-width bins.
 
     ### Receives:
         What aggregate_stddev sends
@@ -472,44 +494,56 @@ class BinningGlobalState(AppState):
         self.store('global_stddev', global_stddev)
         global_mean = self.load('global_mean')
         split_points_bucket = self.load('split_points_bucket')
-            # split_bucket is splits x features_non_quantile x n_bins
-        # TODO: OLD CODE, what do with this? maybe still necessary -> CHECK
-        # This was previously done by both participants and coordinator
-        # right before global_binning
-        # global_binning was renamed to local_calc_bins_normalize
-        # Probably should be here and should be done by participant and coordinator
+            # split_points_bucket is splits x features_non_quantile x (n_bins-1)
 
         X = self.load('X')
         bucket_idcs = np.setdiff1d(np.arange(len(X[0][0])), self.load('quantile'))
         tmp_X_hist = []
 
+        # Create the fixed-width bins
         for split in range(len(X)):
             split_points = np.array(split_points_bucket[split])
-                # split_points is features_non_quantile x n_bins
+                # split_points is features_non_quantile x (n_bins-1)
             X_T = np.transpose(X[split][:, bucket_idcs])
                 # X_T is features_non_quantile x samples
             # Assign data points to bins
-            X_hist = np.array([np.digitize(X_T[i], split_points[i]) \
-                                    for i in range(X_T.shape[0])]) - 1
+            X_hist = np.array([np.digitize(X_T[feature_idx], split_points[feature_idx]) \
+                                    for feature_idx in range(X_T.shape[0])])
+                # Reminder: the split points are the interval ]min, 1, ..., max[
+                # we do not need to supply the min and max value, as according
+                # to the documentation of np.digitize:
+                # If values in x are beyond the bounds of split_points,
+                # 0 or len(split_points) is returned as appropriate.
+                # The interval ]min, 1, ..., max[ has n_bins - 1 split points
+                # therefore we end up with bin indexes 0, ..., n_bins - 1
+                # which is perfect for our purposes
+                # format is features_non_quantile x samples
             tmp_X_hist.append(X_hist)
 
         self.store('X_hist_bucket', tmp_X_hist)
-
-        #TODO: end of old code.
-        #TODO: start of original global binning code
 
         X = self.load('X')
         quantile_idcs = self.load('quantile')
         X_normalized = []
 
         for split in range(len(X)):
-            a = (X[split][:, quantile_idcs] - global_mean[split])
-            b = global_stddev[split]
-            normalized = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
+            # we z-score normalize the data
+            # formula: (x_i - mean) / stddev
+            dividend = (X[split][:, quantile_idcs] - global_mean[split])
+            # format is samples x features_quantile
+            divisor = global_stddev[split]
+            normalized = np.divide(dividend, divisor, out=np.zeros_like(dividend), where=divisor != 0)
+                # set data to 0 if stddev is 0
+                # A a value of 0 means that the sum of differences between
+                # the values and the mean is 0, which is the case if all
+                # values are the same. All values are the same -> stddev of 0
             normalized[normalized == np.inf] = 0
             normalized[normalized == -np.inf] = 0
             normalized[normalized == np.nan] = 0
+                # away with pesky missing values, they shall all be 0
+                # format is samples x features_quantile
             X_normalized.append(normalized)
+                # format is splits x samples x features_quantile
         self.store('X_normalized_quantile', X_normalized)
 
         return 'global_quantile_binning'
@@ -518,7 +552,14 @@ class BinningGlobalState(AppState):
 @app_state('global_quantile_binning', Role.BOTH)
 class GlobalQuantileBinningState(AppState):
     """
-    Quantile Binning.
+    Finally perform the quantile binning, the z-score normalized data
+    is available now.
+
+    ## Receives:
+        nothing
+
+    ## Sends:
+        nothing, saves the quantile binned data
     """
 
     def register(self):
@@ -530,19 +571,43 @@ class GlobalQuantileBinningState(AppState):
         X_hist_list = []
 
         percentiles = np.linspace(1 / n_bins, 1 - 1 / n_bins, n_bins - 1)
+            # Finds the relevant percentiles for quantile binning
+            # e.g. for n_bins = 2, we would want the 50% percentile
+            # the min and max value of the split points are always 0 and 1
+            # we can't use the min (0) and max (1) value as they are -inf and inf
+            # this is why we use n_bins -1 and start at 1/n_bins, end at
+            # 1 - 1/n_bins
         split_points = [norm.ppf(p) for p in percentiles]
-        split_points = np.concatenate((split_points, [np.inf]))
+            # reminder: the data for quantile binning is z-score normalized
+            # -> we assume normally distributed data for the quantile binning
+            # We now go from the percentile, e.g. from 0 to 25% of all values,
+            # to the value x at which all values <= x together make up 25% of all values
+            # norm.ppf does this for us
+            # 1d array of length n_bins - 1
 
         split_points_quantile = []
-
         for split in range(len(X)):
             X_T = np.transpose(X[split])
+                # format is features_quantile x samples
             # Assign data points to bins
             X_hist = np.array([np.digitize(X_T[i], split_points) \
                                     for i in range(X_T.shape[0])])
-            X_hist_list.append(X_hist)
+                # Reminder: the split points are the interval ]min, 1, ..., max[
+                # we do not need to supply the min and max value, as according
+                # to the documentation of np.digitize:
+                # If values in x are beyond the bounds of split_points,
+                # 0 or len(split_points) is returned as appropriate.
+                # The interval ]min, 1, ..., max[ has n_bins - 1 split points
+                # therefore we end up with bin indexes 0, ..., n_bins - 1
+                # the value 0 is therefore membership of that sample for that
+                # feature of the bin 0
+                # which is perfect for our purposes
+                # format is features_quantile x samples
 
+            X_hist_list.append(X_hist)
             split_points_quantile.append(np.tile(split_points, (len(X[split][0]), 1)))
+                # format is splits x features x n_bins - 1
+                # for each feature we have the split points
 
         self.store('split_points_quantile', split_points_quantile)
         self.store('X_hist_quantile', X_hist_list)
@@ -554,6 +619,14 @@ class GlobalQuantileBinningState(AppState):
 class CombineBinningState(AppState):
     """
     Concatenate Quantile Binning Data and Bucket Binning Data.
+    Both use the same indexings, so we can just concatenate them.
+
+    Receives:
+        nothing, loads results previously calculated
+    Sends:
+        class_frequencies (List[Dict[int, int]]): List of dictionaries, each dictionary
+            contains the class frequencies of each split. The keys are the class indices
+            from the classes array. The values are the frequencies of the corresponding class.
     """
 
     def register(self):
@@ -567,38 +640,59 @@ class CombineBinningState(AppState):
         X_hist_quantile = self.load('X_hist_quantile')
         X_hist_bucket = self.load('X_hist_bucket')
         X_hist_list = []
+            # format is splits x samples x features
 
         split_points_quantile = self.load('split_points_quantile')
         split_points_bucket = self.load('split_points_bucket')
+            # split_points_bucket is splits x features_non_quantile x (n_bins-1)
         split_points_list = []
 
         for split in range(len(X)):
             if len(quantile_idcs) > 0 and len(bucket_idcs) > 0:
+                # fixed witdh AND quantile binning
                 X_hist = np.concatenate((X_hist_quantile[split], X_hist_bucket[split]))
+                    # format is features x samples
                 # Place the values of array at specified indices
                 X_hist[quantile_idcs] = X_hist_quantile[split]
                 X_hist[bucket_idcs] = X_hist_bucket[split]
                 X_hist_list.append(np.transpose(X_hist))
+                    # transpose to go back to the normal samples x features format
 
                 split_points = np.tile(split_points_quantile[split], (len(X[split][0]), 1))
+                    # TODO: this looks weird
+                    # already before we save exactly the same thing for each
+                    # feature
+                    # now we save this again for each feature?
+                    # so feature x feature x n_bins - 1
+                    # WHY????
+                    # also why do we overwrite it thhen?
+                    # AMERICA EXPLAIN
+                    # ALSO: we just use percentiles plus norm.ppf,
+                    # SO THEY ARE ALL THE SAME FOR ANY FEATURE
+                    # we save the same thing feature x feature times when
+                    # we would only need it once!
+                    # TODO: fix this
                 # Place the values of array at specified indices
                 split_points[quantile_idcs] = split_points_quantile[split]
                 split_points[bucket_idcs] = split_points_bucket[split]
                 split_points_list.append(split_points)
 
             elif len(bucket_idcs) > 0:
+                # only fixed width binning
                 X_hist_list.append(np.transpose(X_hist_bucket[split]))
                 split_points_list.append(split_points_bucket[split])
 
             else:
+                # only quantile binning
                 X_hist_list.append(np.transpose(X_hist_quantile[split]))
                 split_points_list.append(split_points_quantile[split])
 
         self.store('X_hist', X_hist_list)
+            # format is splits x samples x features
         self.store('split_points', split_points_list)
 
-        # As it can happen that one client does not have all classes,
-        # we need to communicate the classes to all clients
+        # As it can happen that one client does not have all classes
+        # (of the predicted variable), we need to communicate the classes to all clients
         # if we weight the samples by class occurence, we also need to communicate
         # the class frequencies
         class_frequencies = list()
@@ -622,7 +716,9 @@ class CombineBinningState(AppState):
 @app_state('feat_idcs', Role.BOTH)
 class FeatureIndicesState(AppState):
     """
-    Choose feature indices.
+    Choose feature indices based on the max_features parameter.
+    Chooses for each tree in the random forest a random subset of features.
+    The same num_estimators x max_features indices are used in all splits.
     """
 
     def register(self):
@@ -645,12 +741,15 @@ class FeatureIndicesState(AppState):
                 for class_frequency in class_frequency_list:
                     classes.update(class_frequency.keys())
             classes = np.array(list(classes))
+            n_classes = len(classes)
             self.store('classes', classes)
 
             # set weights if necessary
             self.store('weights', None)
             if self.load('weight_classes_bool'):
                 weights = list()
+                    # list index is the split index, contains
+                    # dictionaries with class_i as key and weight as value
                 for split_idx, _ in enumerate(self.load("X")):
                     split_weights = dict()
                     split_total_samples = 0
@@ -664,7 +763,12 @@ class FeatureIndicesState(AppState):
                     # calculate the weight from the frequency plus total samples
                     for class_i, frequency in split_weights.items():
                         if frequency != 0:
-                            split_weights[class_i] = split_total_samples / frequency
+                            split_weights[class_i] = split_total_samples / (n_classes * frequency)
+                            # we implement balanced class weights from the sklearn RandomForestClassifier
+                            # According to their documentation:
+                            # The “balanced” mode uses the values of y to automatically adjust weights
+                            # inversely proportional to class frequencies in the input data as
+                            # n_samples / (n_classes * np.bincount(y))
                         else:
                             split_weights[class_i] = 0
                     weights.append(split_weights)
@@ -674,15 +778,10 @@ class FeatureIndicesState(AppState):
             n_features = self.load('n_features')
             max_features = self.load('max_features')
 
-            if max_features == 'sqrt':
-                max_features = int(np.sqrt(n_features))
-            elif max_features < 1:
-                max_features = int(n_features * max_features)
-            else:
-                max_features = int(max_features)
-            self.store('max_features', max_features)
-
             RF_feat_idcs = []
+                # n_estimators x max_features
+                # contains the feature indices randomly choosen for each
+                # estimator (tree) in the random forest
             for _ in range(self.load('n_estimators')):
                 feat_idcs = np.random.choice(n_features, size= \
                                                 max_features, replace=False)
@@ -764,6 +863,7 @@ class LocalSplitState(AppState):
         y = self.load('y')
         n_bins = self.load('n_bins')
         local_splits = []
+            # split x tree x nodes_current_depth x feature x n_bins
 
         for split in range(len(X_hist)):
             tmp_split = []
@@ -775,14 +875,20 @@ class LocalSplitState(AppState):
                         depth_nodes = decision_tree.cur_depth_nodes
                         for node in depth_nodes:
                             if not node.local_leaf:
-                                local_split_score = split_score(X_hist[split][node.samples], \
-                                                y[split][node.samples], decision_tree.feat_idcs, \
-                                                n_bins, self.load('prediction_mode'), \
-                                                classes=self.load('classes'), \
+                                local_split_score = split_score(X_hist[split][decision_tree.samples],
+                                                y[split][decision_tree.samples],
+                                                decision_tree.feat_idcs,
+                                                n_bins,
+                                                self.load('prediction_mode'),
+                                                classes=self.load('classes'),
                                                 weights=self.load('weights')[split])
                             else:
+                                # leaf node
                                 local_split_score = [[0] * n_bins for _ in \
                                                      range(len(decision_tree.feat_idcs))]
+                                # we set the score of 0 for leaf nodes
+                                # dimensionality needs to fit, we have
+                                # feat_idcs x n_bins
                             tmp_dt.append(local_split_score)
                     if len(tmp_dt) > 0:
                         tmp_split.append(tmp_dt)
