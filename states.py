@@ -292,7 +292,7 @@ class GlobalBinningState1(AppState):
         feature_names = pd.Index(gathered_data[0][2])
         for feature_names_other in gathered_data[1:]:
             feature_names_other = pd.Index(feature_names_other[2])
-            if feature_names.equals(feature_names_other):
+            if not feature_names.equals(feature_names_other):
                 print("Feature names don't match between clients.")
                 print(f"Features client0,otherclient:\n{feature_names}\n{feature_names_other}")
                 print(f"Features just in client0: {set(feature_names) - set(feature_names_other)}")
@@ -895,6 +895,7 @@ class LocalSplitState(AppState):
             if len(tmp_split) > 0:
                 local_splits.append(tmp_split)
         self.send_data_to_coordinator(local_splits)
+            # split x tree x nodes_current_depth x feature x n_bins
 
         return 'aggregate_splits'
 
@@ -915,6 +916,7 @@ class AggregateSplitState(AppState):
         if self.is_coordinator:
             rf_models = self.load('rf_models')
             data = self.gather_data()
+                # split x tree x nodes_current_depth x feature x n_bins
             global_splits = []
             counter_split = 0
 

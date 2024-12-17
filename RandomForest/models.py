@@ -28,7 +28,7 @@ class RandomForest:
     def init_trees(self, y):
         for i in range(self.n_estimators):
             samples = self._bootstrap_samples()
-            root_node = Node(depth=0)
+            root_node = Node(depth=0, samples=samples)
             n_classes = len(np.unique(y[samples]))
             tree = DecisionTree(
                 samples=samples,
@@ -146,9 +146,10 @@ class DecisionTree:
 
 
 class Node:
-    def __init__(self, depth, feature=None, threshold=None, score=None, parent=None,
+    def __init__(self, depth, samples, feature=None, threshold=None, score=None, parent=None,
                   left=None, right=None, global_leaf=False, local_leaf=False, value=None):
         self.depth = depth
+        self.samples = samples
         self.feature = feature
         self.threshold = threshold
         self.score = score
