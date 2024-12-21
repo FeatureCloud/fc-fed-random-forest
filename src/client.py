@@ -1,0 +1,929 @@
+"""
+Contains the client class for the federated learning of a Randomforest using histograms.
+Usage:
+    TODO: write in which order the methods should be called by whom
+"""
+# pylint: disable=invalid-name, too-many-instance-attributes, too-many-arguments
+# pylint: disable=too-many-locals, too-many-branches, too-many-statements
+import os
+from typing import Optional, Union, List, Tuple, Dict, Any
+import logging
+from copy import deepcopy
+import joblib
+
+import bios
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+from src.helper.util import validate_input_data, convert_to_np
+from src.RandomForest.models import RandomForest
+
+class FedHistRandomForestClient():
+    """
+    This class is used for all clientside computations in the learning of a
+    federated Randomforest using histograms.
+    It is meant to be used in conjuction with the coordinator class.
+    #TODO: Add more information on how to use this class
+    """
+    def __init__(self,
+                 config: Optional[dict] = None,
+                 inputfolder: str = "mnt/input",
+                 outputfolder: str = "mnt/output",
+                 logging_class: Optional[logging.Logger] = None) -> None:
+        """
+        #TODO: Add docstring
+        """
+        # Read in all configuration parameters
+        self.inputfolder = inputfolder
+        self.outputfolder = outputfolder
+        if not logging_class:
+            logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            logging_class = logging.getLogger(name='FedHistRandomForestClient')
+        self.logging_class = logging_class
+        self.logging_class.info('Read config-file...')
+        self._read_config(config if config else {})
+        self.logging_class.info("The following parameters were read from the config file:")
+        self.logging_class.info(f"Train: {self.train_filename}; " +\
+             f"Test: {self.test_input_filename}; " +\
+             f"Prediction: {self.pred_filename}; Test output: {self.test_output_filename}; " +\
+             f"Separator: {self.sep}; Label column: {self.label_col}; " +\
+             f"Split mode: {self.split_mode}; "+\
+             f"Split directory: {self.split_dir}; Number of estimators: {self.n_estimators}; "+\
+             f"Criterion: {self.criterion}; Max depth: {self.max_depth}; " +\
+             f"Min samples split: {self.min_samples_split}; " +\
+             f"Min samples leaf: {self.min_samples_leaf}; " +\
+             f"Max features: {self.__max_features_raw}; Bootstrap: {self.bootstrap}; " +\
+             f"Max samples: {self.max_samples_raw}; Random state: {self.random_state}; " +\
+             f"Prediction mode: {self.prediction_mode}; Quantile: {self.__quantile_idcs_raw}; " +\
+             f"Number of bins: {self.n_bins}; Out of bag: {self.oob}; " +\
+             f"Weight classes: {self.weight_classes_bool}; Output mode: {self.output_mode}")
+
+        # Start reading in the data
+        self.logging_class.info('Read data...')
+        X, y, X_test, y_test = [], [], [], []
+
+        self.num_features = 0
+        if self.split_mode == 'directory':
+            self.feature_names: pd.Index = pd.Index([])
+            # multiple datasets as input from crossvalidation
+            for split_name in os.listdir(self.inputfolder + self.split_dir):
+                # Take each folder in the split_dir as it's own dataset
+                train_file = os.path.join(self.inputfolder,
+                                          self.split_dir,
+                                          split_name,
+                                          self.train_filename)
+                test_input_file = os.path.join(self.inputfolder,
+                                               self.split_dir,
+                                               split_name,
+                                               self.test_input_filename)
+                X_, y_, X_test_, y_test_, feature_names_split = \
+                    self._read_files(train_file, test_input_file)
+                if self.num_features == 0:
+                    self.num_features = X_.shape[1]
+                if not self.feature_names:
+                    self.feature_names = deepcopy(feature_names_split)
+                        # we need to deepcpy or else featurenames is just
+                        # a pointer to a pointer that get's changed every loop....
+                elif self.feature_names != feature_names_split:
+                    raise ValueError('Feature names do not match between datasets')
+                validate_input_data(X_, y_, X_test_, y_test_, self.num_features)
+                X.append(X_)
+                y.append(y_)
+                X_test.append(X_test_)
+                y_test.append(y_test_)
+        else:
+            # otherwise just a single dataset
+            train_file = os.path.join(self.inputfolder, self.train_filename)
+            test_input_file = os.path.join(self.inputfolder, self.test_input_filename)
+            X_, y_, X_test_, y_test_, self.feature_names_ = \
+                self._read_files(train_file, test_input_file)
+            self.num_features = X_.shape[1]
+            validate_input_data(X_, y_, X_test_, y_test_, self.num_features)
+            X.append(X_)
+            y.append(y_)
+            X_test.append(X_test_)
+            y_test.append(y_test_)
+
+        try:
+            self.quantile_idcs = np.array(self.__quantile_idcs_raw, dtype=int)
+        except ValueError as e:
+            raise ValueError('Quantile indices must be integers') from e
+        # ensure that the quantile indices are within the number of features
+        if np.any(self.quantile_idcs >= self.num_features):
+            raise ValueError('Quantile indices must be smaller than the number of features')
+        self.fixed_width_idcs = np.setdiff1d(np.arange(self.num_features), self.quantile_idcs)
+
+        # calculate the num_features and max_features
+        self.n_features = X[0].shape[1]
+        if isinstance(self.__max_features_raw, str):
+            if self.__max_features_raw == 'sqrt':
+                self.max_features = int(np.sqrt(self.n_features))
+            else:
+                raise ValueError('Max features must be a float between 0 and 1, " +\
+                                 "an integer or "sqrt"')
+        elif self.__max_features_raw < 1:
+            self.max_features = int(self.n_features * self.__max_features_raw)
+        else:
+            try:
+                self.max_features = int(self.__max_features_raw)
+            except ValueError as e:
+                raise ValueError('Max features must be a float between 0 and 1, " +\
+                                 "an integer or "sqrt"') from e
+
+        np.random.seed(self.random_state)
+
+        # set max_samples to the float format
+        self.max_samples: float = 1.0
+        if self.max_samples_raw is not None:
+            if self.max_samples_raw <= 1 and self.max_samples_raw > 0:
+                self.max_samples = float(self.max_samples_raw)
+            else:
+                raise ValueError('Max samples must be a float between 0 and 1, excluding 0')
+
+        # calculate the class frequencies
+        self.class_frequencies: List[Dict[Any, int]] = []
+            # splits x Dict[class]=class_frequency/0
+        self.class_weights: Optional[List[Dict[Any, Union[int, float]]]] = None
+            # splits x Dict[class]=weight to use in the RandomForest
+            # for any sample of that class
+            # initialized later on by a coord method
+        self.classes = np.unique(y[0])
+        for _y in y:
+            # ensure each split has the same class frequencies
+            classes_y = np.unique(_y)
+            if not np.array_equal(classes_y, self.classes):
+                self.logging_class.warning('Classes differ between splits')
+            frequency_dict = dict()
+            for class_i in self.classes:
+                if self.weight_classes_bool:
+                    frequency_dict[class_i] = np.sum(_y == class_i)
+                else:
+                    frequency_dict[class_i] = 0
+            self.class_frequencies.append(frequency_dict)
+
+        # Store data
+        self.X: List[np.ndarray] = X # (split x num_samples x num_features)
+        self.y: List[np.ndarray] = y # (split x num_samples)
+        self.X_test: List[np.ndarray] = X_test # (split x num_samples x num_features)
+        self.y_test: List[np.ndarray] = y_test # (split x num_samples)
+        self.classes: np.ndarray = np.unique(y[0]) # (num_classes)
+        self.depth: int = 0
+
+        # variables that are set by methods later on
+        self.__split_points_fixed_width: Optional[np.ndarray] = None
+            # splits x feature x n_bins - 1
+        self.split_points: Optional[np.ndarray] = None
+            # splits x n_features x n_bins - 1
+        self.global_means: Optional[List[np.ndarray]] = None
+            # splits x num_features (means per feature)
+        self.global_counts: Optional[List[np.ndarray]] = None
+            # splits x num_features (sample counts globally)
+        self.global_stddevs: Optional[List[np.ndarray]] = None
+            # splits x num_features (stddevs per feature)
+        self.__X_hist_transposed: Optional[List[np.ndarray]] = None
+            # splits x num_samples x num_features (histogram bin indexes)
+            # values are the bin indexes
+        self.X_hist: Optional[List[np.ndarray]] = None
+            # splits x num_features x num_samples (histogram bin indexes)
+            # values are the bin indexes
+        self.global_classes: Optional[np.ndarray] = None
+        self.RF_feat_idcs: Optional[np.ndarray] = None
+            # n_estimators x max_features (feature indices)
+            # values are the feature indices for each estimator (decision tree)
+            # in the random forest to use
+        self.rf_models: Optional[List[RandomForest]] = None
+            # n_estimators RandomForest models
+
+    def get_fixed_width_binning_bounds(self) -> List[np.ndarray]:
+        """
+        Calculates the binning bounds for the fixed width binning.
+        To preserve privacy, the boundaries are the mean of the top/bottom 5%
+        of the data.
+
+        Returns:
+            List[np.ndarray] (splits x 2 x n_features): The binning bounds.
+                First entry in the second dimension is the array of lower bounds,
+                second entry is the array of upper bounds.
+        """
+        result = []
+        for split_data in self.X:
+            split_data = split_data[:, self.fixed_width_idcs]
+            num_samples_total = split_data.shape[0]
+            quantile5_end = int(num_samples_total * 0.05)
+                # the last value to consider in a sorted array for the 5% quantile
+            quantile95_start = int(num_samples_total * 0.95)
+                # the first value to consider in a sorted array for the 95% quantile
+            # MISSING_VALUES_SUPPORT: use the correct num_samples here as this changes per feature
+
+            # get the per column mean of the top/bottom 5% of the values per feature
+            split_data_sorted = np.sort(split_data, axis=0)
+                # sort per column (per feature)
+                # sorts ascending
+                # fun fact: the documentation of np.sort does not contain the
+                # word ascending nor descending
+            min_array = np.mean(split_data_sorted[:quantile5_end], axis=0)
+            max_array = np.mean(split_data_sorted[quantile95_start:], axis=0)
+                # column-wise mean -> per feature mean as one vector
+            result.append(np.array([min_array, max_array]))
+        return result
+
+    def set_fixed_witdh_bins(self, global_split_points: List[np.ndarray]) -> None:
+        """
+        Based on the given split points for the fixed width binning, assigns the
+        data points to the bins and stores the bin indexes in self.__X_hist_transposed.
+        Quantile binning then finalizes and creates self.X_hist.
+
+        Args: global_split_points: List[List[List[float]]] (splits x n_features x n_bins - 1):
+            The global split points for the fixed width binning. Open interval
+            without a min/max value.
+
+        Returns:
+            None, just sets self.X_hist of the self.fixed_width_idcs
+        """
+        if self.__X_hist_transposed is None:
+            self.__X_hist_transposed = []
+        for split_idx, X in enumerate(self.X):
+            split_points = global_split_points[split_idx]
+            split_points = np.array(split_points)
+            X_T = np.transpose(X[:, self.fixed_width_idcs])
+            X_hist_fixed_witdh = \
+                np.array([np.digitize(X_T[feature_idx], split_points[feature_idx]) \
+                                    for feature_idx in range(X_T.shape[0])])
+                # Reminder: the split points are the interval ]min, 1, ..., max[
+                # we do not need to supply the min and max value, as according
+                # to the documentation of np.digitize:
+                # If values in x are beyond the bounds of split_points,
+                # 0 or len(split_points) is returned as appropriate.
+                # The interval ]min, 1, ..., max[ has n_bins - 1 split points
+                # therefore we end up with bin indexes 0, ..., n_bins - 1
+                # which is perfect for our purposes
+                # format is features_non_quantile x samples
+            if len(self.__X_hist_transposed) <= split_idx:
+                # for this split there is no entry yet
+                self.__X_hist_transposed.append(np.zeros((self.num_features, X.shape[0])))
+                    # we first create the full X_hist matrix
+                    # and now only overwrite the fixed_width_idcs
+                self.__X_hist_transposed[split_idx][self.fixed_width_idcs, :] = X_hist_fixed_witdh
+            else:
+                # for this split there is already an entry
+                # we want to overwrite only the fixed_width_idcs
+                self.__X_hist_transposed[split_idx][self.fixed_width_idcs, :] = X_hist_fixed_witdh
+
+    def set_quantilie_bins(self, global_stddevs:List[List[float]]) -> None:
+        """
+        Based on the given global standard deviations for the quantile features,
+        and previously calculated global_means and global_counts, assigns the
+        bins to the data points desginated for quantile binning.
+        Furthermore, merges the fixed width and quantile binning and created
+        X_hist.
+        Quantile binning is done by z-score normalizing the data and then
+        assigning the data points to the bins based on the z-score and their
+        corresponding percentiles.
+
+        Args:
+            global_stddevs: List[List[float]] (splits x num_features):
+                The global standard deviation for each feature.
+        """
+        if not self.__X_hist_transposed:
+            raise ValueError('Fixed width binning must be set before quantile binning')
+        if not self.global_means:
+            raise ValueError('Global means must be set before quantile binning')
+        if not self.global_counts:
+            raise ValueError('Global counts must be set before quantile binning')
+        if not self.__split_points_fixed_width:
+            raise ValueError('Fixed width binning must be set before quantile binning')
+        X_normalized = []
+        for split_idx, split_data in enumerate(self.X):
+            # we z-score normalize the data
+            # formula: (x_i - mean) / stddev
+            dividend = (split_data[:, self.quantile_idcs] - self.global_means[split_idx])
+            # format is samples x features_quantile
+            divisor = np.array(global_stddevs[split_idx])
+            normalized = np.divide(dividend, divisor,
+                                   out=np.zeros_like(dividend),
+                                   where=divisor != 0)
+                # set data to 0 if stddev is 0
+                # A a value of 0 means that the sum of differences between
+                # the values and the mean is 0, which is the case if all
+                # values are the same. All values are the same -> stddev of 0
+            normalized[normalized == np.inf] = 0
+            normalized[normalized == -np.inf] = 0
+            normalized[normalized == np.nan] = 0
+                # away with pesky missing values, they shall all be 0
+                # format is samples x features_quantile
+            X_normalized.append(normalized)
+                # format is splits x samples x features_quantile
+
+        percentiles = np.linspace(1 / self.n_bins, 1 - 1 / self.n_bins, self.n_bins - 1)
+            # Finds the relevant percentiles for quantile binning
+            # e.g. for n_bins = 2, we would want the 50% percentile
+            # the min and max value of the split points are always 0 and 1
+            # we can't use the min (0) and max (1) value as they are -inf and inf
+            # this is why we use n_bins -1 and start at 1/n_bins, end at
+            # 1 - 1/n_bins
+        split_points_quantile = [norm.ppf(p) for p in percentiles]
+            # reminder: the data for quantile binning is z-score normalized
+            # -> we assume normally distributed data for the quantile binning
+            # We now go from the percentile, e.g. from 0 to 25% of all values,
+            # to the value x at which all values <= x together make up 25% of all values
+            # norm.ppf does this for us
+            # 1d array of length n_bins - 1
+
+        for split_idx, split_data in enumerate(X_normalized):
+            X_T = np.transpose(split_data[split_idx, :])
+                # format is features_quantile x samples
+                # X_normalized is already just the quantile features
+            # Assign data points to bins
+            X_hist_transposed = np.array([np.digitize(X_T[i], split_points_quantile) \
+                                    for i in range(X_T.shape[0])])
+                # Reminder: the split points are the interval ]min, 1, ..., max[
+                # we do not need to supply the min and max value, as according
+                # to the documentation of np.digitize:
+                # If values in x are beyond the bounds of split_points,
+                # 0 or len(split_points) is returned as appropriate.
+                # The interval ]min, 1, ..., max[ has n_bins - 1 split points
+                # therefore we end up with bin indexes 0, ..., n_bins - 1
+                # the value 0 is therefore membership of that sample for that
+                # feature of the bin 0
+                # which is perfect for our purposes
+                # format is features_quantile x samples
+            if len(self.__X_hist_transposed) <= split_idx or \
+                self.__X_hist_transposed[split_idx].shape[0] != self.num_features or \
+                self.__X_hist_transposed[split_idx].shape[1] != self.X[split_idx].shape[0]:
+                raise ValueError('Fixed width binning must be set before quantile binning')
+
+            self.__X_hist_transposed[split_idx][self.quantile_idcs, :] = X_hist_transposed
+                # we overwrite the quantile features in the X_hist matrix
+
+        # create X_hist
+        self.X_hist = []
+        for split_idx, split_data in enumerate(self.__X_hist_transposed):
+            self.X_hist.append(np.transpose(split_data))
+                # just transpose from features x samples to samples x features
+
+        # Also save merged split points
+        self.split_points = np.zeros((len(self.X), self.num_features, self.n_bins - 1))
+            # splits x features x n_bins - 1
+        for split_idx, _ in enumerate(self.X_hist):
+            self.split_points[split_idx, self.fixed_width_idcs, :] = \
+                self.__split_points_fixed_width[split_idx]
+            self.split_points[split_idx, self.quantile_idcs, :] = \
+                np.tile(split_points_quantile, len(self.quantile_idcs))
+
+    def get_quantile_binning_aggregation(self) -> List[np.ndarray]:
+        """
+        Calculates the sum of all quantile_features as well as the sample count.
+
+        Returns:
+            List[np.ndarray] (split x n_quantile_features x 2):
+            The first entry in the last dimension is the array of sample counts,
+            the second entry is the array of column-wise sums.
+        """
+        result = []
+        for split_data in self.X:
+            split_data = split_data[:, self.quantile_idcs]
+            num_features_quantile = split_data.shape[1]
+            local_matrix = np.zeros((num_features_quantile, 2))
+            # if num_features_quantile = 0, these will have no effect
+            # as there is no row to fill
+            local_matrix[:, 0] = split_data.shape[0] # num_rows = num_samples
+                # MISSING_VALUES_SUPPORT: don't use shape, get count without missing values
+            local_matrix[:, 1] = np.sum(split_data, axis=0)
+                # column-wise sum -> per feature sum as one vector
+            result.append(local_matrix)
+        return result
+
+    def calc_local_stddev(self,
+                          global_means: List[List[float]],
+                          global_counts: List[List[int]]) -> List[np.ndarray]:
+        """
+        Given the global_means and global_counts, calculates the local standard deviation
+        per feature for the quantile features and returns them.
+
+        Args:
+            global_means: List[List[float]] (splits x num_features):
+                The global mean for each feature.
+            global_counts: List[List[int]] (splits x num_features):
+                The global sample count for each feature.
+        """
+        self.global_means = [np.array(d) for d in global_means]
+        self.global_counts = [np.array(d) for d in global_counts]
+            # MISSING_VALUES_SUPPORT: in this case the sample counts might differ and the following
+            # check is not valid
+        # ensure all global_counts are the same value per split
+        for split_global_counts in self.global_counts:
+            if not np.all(split_global_counts == split_global_counts[0]):
+                raise ValueError('Global counts differ between features')
+        stddevs = []
+            # format is splits x num_features_quantile
+            # each entry is the standard deviation for the corresponding feature
+            # and split
+            # Caveat: we don't send exactly the standard deviation but the sum of
+            # (x_i - mean)^2
+            # The global client can then devide by the number of samples
+            # we could divide in each client, but we can simply only do the division
+            # once in the end -> less calculations
+        for split_idx, split_data in enumerate(self.X):
+            X_quantile = split_data[:, self.quantile_idcs]
+                # samples x features_quantile
+                # Extract only the features that are used for quantile binning
+                # from the raw data
+            # formula stddev is sqrt(sum(x_i - mean)^2 / num_samples)
+            local_stddev = np.sum(((X_quantile - self.global_means[split_idx]) ** 2) /
+                                  self.global_counts[split_idx], axis=0)
+                # X_quantile is samples x features_quantile, means[split_idx]
+                # and sample_counts[split_idx] are vectors of shape features_quantile
+                # broadcasting applies means and sample_counts row-wise (sample axis)
+                # np.sum is used to collapse the samples axis
+                # final shape becomes features_quantile vector
+            stddevs.append(local_stddev)
+                # stddevs gets shape splits x features_quantile with each
+                # entry being the local stddev for the corresponding feature
+
+        # we don't save the stddevs as we don't need them later on, we only
+        # need the global stddevs later on
+        return stddevs
+
+    def get_class_frequencies(self) -> List[Dict[Any, int]]:
+        """
+        Receives a dictionary specifying a value per class in y.
+
+        In case of weighted classes, the value is the frequency of the class.
+        Otherwise, the value is 0.
+
+        Returns:
+            Dict[int, int]: The class frequencies.
+        """
+        if len(self.class_frequencies) == 0:
+            raise ValueError('Class frequencies have not been calculated yet')
+        return self.class_frequencies
+
+    def get_class_weights(self) -> Optional[List[Dict[Any, Union[int, float]]]]:
+        """
+        Returns the class weights for each split.
+        If class weights should be set but are not, raises a ValueError.
+        """
+        if self.weight_classes_bool and self.class_weights is None:
+            raise ValueError('Class weights have not been set yet but should be set')
+        return self.class_weights
+
+    def get_available_classes(self) -> np.ndarray:
+        """
+        Returns the available classes.
+        """
+        return self.classes
+
+    def set_RF_feat_idcs(self, RF_feat_idcs: List[List[int]]) -> None:
+        """
+        Sets the feature indices for the random forest.
+
+        Args:
+            RF_feat_idcs: List[List[int]] (n_estimators x max_features):
+                The feature indices for the random forest.
+        """
+        self.RF_feat_idcs = np.array(RF_feat_idcs)
+
+    def set_available_classes(self, classes: List[Any]) -> None:
+        """
+        Sets the available classes. Throws a warning if the current classes
+        differ from the new classes.
+        """
+        if set(classes) != set(self.classes):
+            self.logging_class.warning('This client has different classes " +\
+                                       "than the union of classes')
+        self.global_classes = np.array(classes)
+        self.global_classes.sort()
+
+    def set_class_weights(self, weights: Optional[List[Dict[Any, Union[int, float]]]]) -> None:
+        """
+        Sets the class weights for each split.
+
+        Args:
+            weights: List[Dict[int, int]] (splits x dict[class]=weight):
+                The class weights for each split.
+        """
+        if self.weight_classes_bool and not weights:
+            raise ValueError('Trying to set empty class weights also class weighting is enabled')
+        self.class_weights = weights
+
+    def init_forest(self) -> None:
+        """
+        Initializes the random forest model.
+        Needs to be called after all other initialization methods are called.
+        """
+        self.logging_class.info('Initialize forest...')
+
+        if self.prediction_mode not in ['classification', 'regression']:
+            raise AttributeError('Only classification and regression are valid modes.')
+        if not self.RF_feat_idcs:
+            raise AttributeError('Feature indices must be set before initializing the forest.')
+        if not self.X_hist or not self.split_points:
+            raise AttributeError('Binning information must be set before initializing the forest.')
+        if not self.global_means or not self.global_stddevs or not self.global_counts:
+            raise AttributeError('Global statistics must be set before initializing the forest.')
+        if not self.global_classes:
+            raise AttributeError('Global classes must be set before initializing the forest.')
+
+
+        self.rf_models = []
+            # per split a RandomForest model
+        for split_idx, _ in enumerate(self.X_hist):
+            rf_model: RandomForest = \
+                RandomForest(n_estimators=self.n_estimators,
+                             global_classes=self.global_classes,
+                             random_state=self.random_state,
+                             max_depth=self.max_depth,
+                             min_samples_split=self.min_samples_split,
+                             min_samples_leaf=self.min_samples_leaf,
+                             bootstrap=self.bootstrap,
+                             feat_idcs=self.RF_feat_idcs,
+                             n_patients_local=self.X_hist[split_idx].shape[0],
+                             n_patients_global=self.global_counts[split_idx][0],
+                                # MISSING_VALUES_SUPPORT: don't use the first features entry
+                                # but use the info for all features
+                             max_samples=self.max_samples,
+                             quantile=self.quantile_idcs,
+                             global_mean=self.global_means[split_idx],
+                             global_stddev=self.global_stddevs[split_idx],
+                             split_points=self.split_points[split_idx],
+                             prediction_mode=self.prediction_mode,
+                             oob=self.oob)
+            self.rf_models.append(rf_model)
+
+    def coord_ensure_config_alignment(self,
+                                      feature_names: List[List[str]],
+                                      quantile_idcs: List[List[int]],
+                                      fixed_width_idcs: List[List[int]]) -> None:
+        """
+        Receives the feature names, quantile indices and fixed width indices
+        of all different clients and ensures they are the same.
+        Should only be called by the aggregator.
+        """
+        if not all([feature_names[0] == feature_name for feature_name in feature_names]):
+            print("ERROR: Feature names do not match between clients")
+            # print union vs intersection of feature names
+            print(f"INTERSECTION of features: {set.intersection(*[set(f) for f in feature_names])}")
+            print(f"UNION of features: {set.union(*[set(f) for f in feature_names])}")
+            raise ValueError('Feature names do not match between clients')
+        if not all([quantile_idcs[0] == quantile_idx for quantile_idx in quantile_idcs]):
+            print("ERROR: Quantile indices do not match between clients")
+            print("INTERSECTION of quantile indices: " +\
+                  f"{set.intersection(*[set(q) for q in quantile_idcs])}")
+            print(f"UNION of quantile indices: {set.union(*[set(q) for q in quantile_idcs])}")
+            raise ValueError('Quantile indices do not match between clients')
+        if not all([fixed_width_idcs[0] == fixed_width_idx \
+                    for fixed_width_idx in fixed_width_idcs]):
+            print("ERROR: Fixed width indices do not match between clients")
+            print("INTERSECTION of fixed width indices: " +\
+                  f"{set.intersection(*[set(f) for f in fixed_width_idcs])}")
+            print(f"UNION of fixed width indices: {set.union(*[set(f) for f in fixed_width_idcs])}")
+            raise ValueError('Fixed width indices do not match between clients')
+
+    def coord_ensure_same_num_splits(self,
+                                     fixed_width_binning_bounds: List[List[Any]],
+                                     quantile_binning_aggregation: List[List[Any]]) -> None:
+        """
+        Ensures that the number of splits is the same for all clients.
+
+        Args:
+            fixed_width_binning_bounds: List[np.ndarray] (clients x splits x 2 x num_features):
+                The binning bounds for fixed width binning.
+            quantile_binning_aggregation: List[np.ndarray] (clients x splits x num_features x 2):
+                The sums and sample counts for the quantile features.
+
+        Raises:
+            ValueError: If the number of splits differ between clients or if the number of clients
+                differ between fixed width and quantile binning.
+        """
+        if len(fixed_width_binning_bounds) != len(quantile_binning_aggregation):
+            raise ValueError('Number of clients differ between fixed width and quantile binning')
+        splits = {len(d) for d in fixed_width_binning_bounds}
+        if len(splits) != 1:
+            raise ValueError('The number of splits differ between clients')
+
+    def coord_calculate_global_fixed_width_binning_splitpoints(self,
+                                                        bounds: List[List[List[List[Any]]]]) \
+                                                        -> np.ndarray:
+        """
+        Calculates the splitpoints for the fixed width binning.
+        Should only be called by the aggregator.
+        Stores the splitpoints in self.__split_points_fixed_width as np.ndarray
+        and returns them as list.
+
+        Args:
+            bounds: List[np.ndarray] (clients x splits x 2 x num_features): The binning bounds.
+                First entry in the last dimension is the array of lower bounds,
+                second entry is the array of upper bounds.
+
+        Returns:
+            List[np.ndarray] (splits x n_features x n_bins - 1): The splitpoints.
+            for n_bins n_bins + 1 split points exist, we only need n_bins - 1
+            as we don't need the min and max split points (basically open intervals)
+        """
+        splitpoints_fixed_witdh = []
+            # split x feature x n_bins - 1
+            # for n_bins n_bins + 1 split points exist, we only need n_bins - 1
+            # as we don't need the min and max split points (basically open intervals)
+        for split_idx, split_data in enumerate(self.X):
+            split_data = split_data[:, self.fixed_width_idcs]
+            min_max_values = [bounds[i][split_idx] for i in range(len(bounds))]
+                # extract the min/max values for this specific split
+                # dimension is therefore clients x 2 x num_features
+            min_max_values = np.array(min_max_values)
+                # np.array of shape clients x 2 x num_features
+            min_values_all = min_max_values[:, 0, :]
+            max_values_all = min_max_values[:, 1, :]
+                # shape clients x num_features
+            min_values = np.min(min_values_all, axis=0)
+            max_values = np.max(max_values_all, axis=0)
+                # reduce via min/max from clients x num_features to num_features,
+                # finding the min over all clients
+            splitpoints_per_split = [np.linspace(float(min_values[feature_idx]), \
+                                                 float(max_values[feature_idx]), \
+                self.n_bins + 1) for feature_idx in range(len(min_values))]
+                # n_bins + 1 as for n_bins we need n_bins + 1 split points
+                # 2 bins -> min, 1, max needed as split points
+                # np.linspace includes the start and stop value
+            splitpoints_fixed_witdh.append([split_points[1:-1] \
+                                            for split_points in splitpoints_per_split])
+                # We neither need min nor max due to how np.digitize works
+
+        self.__split_points_fixed_width = np.array(splitpoints_fixed_witdh)
+        return self.__split_points_fixed_width
+
+    def coord_calculate_global_mean_count(self,
+                                          data: List[List[List[List[Any]]]]) \
+            -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """
+        Given the sums and sample counts for the quantile features per client,
+        calculates the global mean and the global sample count.
+
+        Args:
+            data: List[np.ndarray] (clients x splits x num_features x 2):
+                The first entry in the last dimension is the array of column wise sample counts,
+                the second entry is the array of column-wise sums.
+
+        Returns:
+            Tuple[List[np.ndarray], List[np.ndarray]]:
+                broadcast_means: List[np.ndarray] (splits x num_features):
+                    The global mean for each feature.
+                sample_counts: List[np.ndarray] (splits x num_features):
+                    The global sample count for each feature.
+        """
+        means = []
+            # splits x features, each entry being the mean for the corresponding feature
+            # globally
+        sample_counts = []
+            # splits x features, each entry being the number of samples
+            # for the corresponding feature globally
+
+        # calculate the global mean
+        for split_idx, _ in enumerate(self.X):
+            try:
+                mean_count_arr = np.array([d[split_idx] for d in data])
+                # format is clients x num_features x 2, we removed the split
+                # axis due to the split loop
+            except IndexError as e:
+                raise ValueError('The number of splits differ between clients') from e
+            global_matrix = np.sum(mean_count_arr, axis=0)
+                # we sum over the clients axis, new format is num_features x 2
+            accumulated_sample_count = global_matrix[:, 0] # vector of shape num_features
+            accumulated_sum = global_matrix[:, 1] # vector of shape num_features
+            mean = accumulated_sum / accumulated_sample_count # vector of shape num_features
+            means.append(mean)
+            sample_counts.append(accumulated_sample_count)
+        self.global_means = means
+        self.global_counts = sample_counts
+        return means, sample_counts
+
+    def coord_aggregate_stddevs(self, stddevs: List[List[List[float]]]) -> List[np.ndarray]:
+        """
+        Aggregates the standard deviations from all clients to a global standard deviation.
+
+        Args:
+            stddevs: List[np.ndarray] (clients x splits x num_features):
+                The standard deviation for each feature per client.
+
+        Returns:
+            List[np.ndarray] (splits x num_features): The global standard deviation.
+        """
+        global_stddevs = []
+        for split_idx, _ in enumerate(self.X):
+            try:
+                data = np.array([d[split_idx] for d in stddevs])
+                # format is clients x features_quantile
+            except IndexError as e:
+                raise ValueError('The number of splits differ between clients') from e
+            global_stddev_split = np.sum(data, axis=0)
+                # collapse the clients axis, clients x features_quantile -> features_quantile
+            global_stddevs.append(global_stddev_split)
+                # global_stddevs is splits x features_quantile
+        self.global_stddevs = global_stddevs
+        return global_stddevs
+
+    def coord_set_class_weights(self,
+                                class_frequencies_clients: List[List[Dict[int, int]]]) -> None:
+        """
+        Calculates class weights for each split based on the frequencies of the classes
+        in the data.
+        The weighting is heavily inspired (aka taken) from the sklearn RandomForestClassifier
+        class_weight = "balanced" mode.
+        According to their documentation:
+        The “balanced” mode uses the values of y to automatically adjust weights inversely
+        proportional to class frequencies in the input data as
+        n_samples / (n_classes * np.bincount(y))
+
+        Args:
+            class_frequencies_clients: List[List[Dict[int, int]]]
+            (clients x splits x dict[class]=frequency):
+                The class frequencies from all clients as a list.
+
+        Returns:
+            None, sets the weights in self.class_weights
+        """
+
+        # update classes to have all global classes
+        classes = set()
+        for class_frequency_list in class_frequencies_clients:
+            for class_frequency in class_frequency_list:
+                prev_len = len(classes)
+                classes.update(class_frequency.keys())
+                if len(classes) != prev_len and prev_len != 0:
+                    self.logging_class.warning('Classes differ between clients')
+
+        classes = np.array(list(classes))
+        n_classes = len(classes)
+        if set(classes) != set(self.classes):
+            self.logging_class.warning('This client has different classes " +\
+                                       "than the union of classes')
+        self.classes = classes
+
+        # set weights if necessary
+        if self.weight_classes_bool:
+            weights: List[Dict[Any, Union[int, float]]] = []
+                # list index is the split index, contains
+                # dictionaries with class_i as key and weight as value
+            for split_idx, _ in enumerate(self.X):
+                split_weights: Dict[Any, float] = {}
+                split_total_samples = 0
+                # get the pure frequency counts per split per class
+                for client_class_frequencies in class_frequencies_clients:
+                    for class_i, frequency in client_class_frequencies[split_idx].items():
+                        if class_i not in split_weights:
+                            split_weights[class_i] = 0
+                        split_weights[class_i] += frequency
+                        split_total_samples += frequency
+                # calculate the weight from the frequency plus total samples
+                for class_i, frequency in split_weights.items():
+                    if frequency != 0:
+                        split_weights[class_i] = split_total_samples / (n_classes * frequency)
+                        # we implement balanced class weights from the
+                        # sklearn RandomForestClassifier
+                        # According to their documentation:
+                        # The “balanced” mode uses the values of y to automatically adjust weights
+                        # inversely proportional to class frequencies in the input data as
+                        # n_samples / (n_classes * np.bincount(y))
+                    else:
+                        split_weights[class_i] = 0
+                weights.append(split_weights)
+
+            self.class_weights = weights
+
+    def coord_get_RF_feat_idcs(self) -> np.ndarray:
+        """
+        Based on self.max_features, self.n_features and self.n_estimators,
+        chooses for each estimator (decision tree) in the random forest
+        a random set of feature indices. The set size is determined by
+        self.max_features.
+
+        Returns:
+            np.ndarray (n_estimators x max_features): The feature indices.
+        """
+        RF_feat_idcs = np.random.choice(self.n_features,
+                                        size=(self.n_estimators, self.max_features),
+                                        replace=False)
+        self.RF_feat_idcs = RF_feat_idcs
+        return RF_feat_idcs
+
+    def _read_config(self, config: dict):
+        """
+        Reads the configuration file and sets the parameters for the random forest.
+        If a config dict is given instead, uses that to read the parameters.
+        Check the repositories example config.yml/ the README
+        for more information on the config file.
+        https://github.com/FeatureCloud/fc-fed-random-forest
+        """
+        if not config:
+            # try to read the config from file
+            config_name = "config.yml"
+            if not os.path.exists(f'{self.inputfolder}/{config_name}'):
+                config_name = "config.yaml"
+            config = bios.read(f'{self.outputfolder}/{config_name}')
+        try:
+            config = config['fc-rand-forest']
+
+            config_input = config['input']
+            self.train_filename: str = config_input['train']
+            self.test_input_filename: str = config_input['test']
+
+            config_output = config['output']
+            self.pred_filename: str = config_output['pred']
+            self.test_output_filename: str = config_output['test']
+
+            config_format = config['format']
+            self.sep: str = config_format.get('sep', ',')
+            self.label_col: str = config_format['label_col']
+
+            config_split = config['split']
+            self.split_mode: str = config_split['mode']
+            self.split_dir: str = config_split['dir']
+
+            # Parameters RandomForest
+            self.n_estimators: int = int(config.get('n_estimators', 100))
+            self.criterion: str = config.get('criterion', 'gini')
+            self.max_depth: int = int(config.get('max_depth', 10))
+            self.min_samples_split: int = config.get('min_samples_split', 2)
+            self.min_samples_leaf: int = config.get('min_samples_leaf', 1)
+            self.__max_features_raw: Union[str, float, int] = config.get('max_features', 'sqrt')
+            self.bootstrap: bool = config.get('bootstrap', True)
+            self.max_samples_raw: Union[None, float, int] = config.get('max_samples', None)
+            self.random_state: int = int(config.get('random_state', 0))
+            self.weight_classes_bool: bool = config.get('use_weighted_classes', False)
+            self.__quantile_idcs_raw: List[int] = config.get('quantile', [])
+            self.oob: bool = config.get('oob', False)
+
+            self.prediction_mode: str = config['mode']
+            if self.prediction_mode not in ['classification', 'regression']:
+                raise ValueError('Mode must be either "classification" or "regression"')
+            if self.prediction_mode == 'regression' and self.weight_classes_bool:
+                raise ValueError('Weights are not supported for regression, " +\
+                                 "there are no classes to weight in regression')
+
+            n_bins: Union[str, int] = config['n_bins']
+            try:
+                self.n_bins = int(n_bins)
+            except ValueError as e:
+                raise ValueError('Number of bins must be an integer') from e
+            if self.n_bins < 2:
+                raise ValueError('Number of bins must be at least 2')
+
+            self.output_mode = config.get('output_mode', 'model')
+            if self.output_mode not in ['model', 'pred', 'model+pred']:
+                raise ValueError('Output mode must be either "model" or "pred" or "model+pred".')
+
+        except KeyError as e:
+            raise KeyError('Config file is missing key') from e
+        except TypeError as e:
+            raise TypeError('Config file does contain an invalid value') from e
+        except Exception as e:
+            raise ValueError('Unknown error while reading the config') from e
+
+    def _read_files(self, train: str, test_input: str) \
+            -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.Index]:
+        """
+        Reads the train and test data files and returns the data as numpy arrays.
+        Ensures that the feature names in the train and test data match, if not
+        raises an ValueError.
+        Args:
+            train: str: Name of the train file. Should be the full path.
+            test_input: str: Name of the test file. Should be the full path.
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
+                X: np.ndarray: Train data.
+                y: np.ndarray: Train labels.
+                X_test: np.ndarray: Test data.
+                y_test: np.ndarray: Test labels.
+                feature_names: List[str]: Feature names.
+        Raises:
+            ValueError: If the feature names in the train and test data do not match.
+        """
+        train_df = pd.read_csv(train, sep=self.sep)
+        test = pd.read_csv(test_input, sep=self.sep)
+        X_train = train_df.drop(self.label_col, axis=1)
+        X_test = test.drop(self.label_col, axis=1)
+        y_train = train_df.loc[:, self.label_col]
+        y_test = test.loc[:, self.label_col]
+        # check if we have any missing values and raise an error if yes
+        if X_train.isnull().values.any() or y_train.isnull().any():
+            raise ValueError("Missing values in train data.")
+        if X_test.isnull().values.any() or y_test.isnull().any():
+            raise ValueError("Missing values in test data.")
+        feature_names = X_train.columns
+        if not feature_names.equals(X_test.columns):
+            print("Feature names in train and test data match.")
+            print(f"Features train,test:\n{X_train.columns}\n{X_test.columns}")
+            print("Features just in train data: " +\
+                  f"{set(X_train.columns) - set(X_test.columns)}")
+            print("Features just in test data: " +\
+                  f"{set(X_test.columns) - set(X_train.columns)}")
+            raise ValueError("Feature names in train and test data do not match.")
+        # MISSING_VALUES_SUPPORT: remove columns without ANY values, also
+        # remove them from feature_names
+        X = convert_to_np(X_train)
+        y = convert_to_np(y_train)
+        X_test = convert_to_np(X_test)
+        y_test = convert_to_np(y_test)
+
+        return X, y, X_test, y_test, feature_names

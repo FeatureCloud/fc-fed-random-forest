@@ -1,4 +1,10 @@
+"""
+Contains small helper functions for the project.
+"""
 import numpy as np
+import pandas as pd
+# pylint: disable=invalid-name
+
 def validate_input_data(X_: np.ndarray, y_: np.ndarray, X_test_: np.ndarray, y_test_: np.ndarray, num_features: int):
     """
     Checks if the input data is valid.
@@ -30,3 +36,13 @@ def validate_input_data(X_: np.ndarray, y_: np.ndarray, X_test_: np.ndarray, y_t
         raise ValueError('label column could not be extracted to an 1d array.')
     if X_.shape[1] != num_features or X_test_.shape[1] != num_features:
         raise ValueError('Number of features in all splits must be equal.')
+
+def convert_to_np(data):
+    """
+    Simple function to convert a Pandas Series or DataFrame to a numpy array.
+    Failed conversion raises a ValueError.
+    """
+    if isinstance(data, (pd.Series, pd.DataFrame)):
+        return data.to_numpy()
+    else:
+        raise ValueError("Input data is not a Pandas Series or DataFrame.")

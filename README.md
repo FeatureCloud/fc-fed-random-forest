@@ -52,12 +52,11 @@ fc_random_forest:
   min_samples_split: 2 # minimum number of samples required to split an internal node
   min_samples_leaf: 1 # minimum number of samples required to be at a leaf node
   max_features: 'sqrt' # number of features to consider when looking for the best split
-  max_samples: 0.75 # number of samples to draw from X to train each base estimator
+  max_samples: 0.75 # percentage of samples to draw for each decision tree
   bootstrap: True # whether bootstrap samples are used when building trees
   n_bins: 10 # number of bins used for each feature
   quantile: [0,1] # The feature indices to use for quantile binning. 
-                # If this is not given or an empty array is given, 
-                # quantile binning is used on all features
+                # If an empty list is specified, only fixed width binning is used.
   random_state: 42 # random state for reproducibility
   oob: True # use out-of-bag error to weight decision trees
   use_weighted_classes: False # if set to True, all classes are given the same 
