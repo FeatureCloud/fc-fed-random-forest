@@ -1,4 +1,4 @@
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Dict, Any, List, Iterator
 
 import numpy as np
 from scipy import stats
@@ -29,7 +29,7 @@ class RandomForest:
                  global_classes: np.ndarray, # global classes. Should be the same in the
                                         # same order for all clients
                  oob: bool,
-                 class_weights: Optional[Dict[Any, float]] = None,
+                 class_weights: Optional[Dict[Any, float]],
                     # weights of the classes (dict[class]=weight)
                 ) -> None:
         self.n_estimators = n_estimators
@@ -42,7 +42,7 @@ class RandomForest:
         self.n_patients_global = n_patients_global
         self.bootstrap = bootstrap
         self.random_state = random_state
-        self.decision_trees = []
+        self.decision_trees: List[DecisionTree] = []
         np.random.seed(random_state)
         self.quantile = quantile
         self.global_mean = global_mean
@@ -73,6 +73,7 @@ class RandomForest:
         return sample_idcs
 
     def predict(self, X):
+        #TODO: double check this, this funcction was not verified!!!
         bucket_idcs = np.setdiff1d(np.arange(len(X[0])), self.quantile)
 
         if len(bucket_idcs) > 0:
@@ -135,6 +136,36 @@ class RandomForest:
 
         return predicted_values
 
+    def iterate_trees(self) -> Iterator["DecisionTree"]:
+        """
+        Iterate over the decision trees in the random forest.
+        """
+        for tree in self.decision_trees:
+            yield tree
+
+    def get_split_scores(self, X_Hist: np.ndarray, y: np.ndarray, n_bins: int) -> List[List[List[List[float]]]]:
+        """
+        Calculate the score of a split for each feature and bin. Works on the cur_depth_nodes.
+        If they already have an assigned feature and threshold, an error is thrown.
+
+        Args:
+            X_hist: input data, 2d array of shape (n_samples, n_features).
+                The values are NOT the actual values but the bin indices the samples belong to
+                for each feature.
+            y: target data, 1d array of shape (n_samples), indicating the target value
+                for each sample
+            n_bins: number of bins to consider for each feature.
+
+        Returns:
+            scores: 4d array of shape (n_estimators, num_nodes_cur_level,
+            len(self.feat_idcs), n_bins), containing the score of a split per feature and bin.
+        """
+        scores = []
+        for tree in self.decision_trees:
+            tree_scores = tree.get_split_scores(X_Hist, y, n_bins)
+            scores.append(tree_scores)
+        return scores
+
 
 class DecisionTree:
     """
@@ -151,7 +182,7 @@ class DecisionTree:
                  mode: str, # classification or regression
                  global_classes: np.ndarray, # global classes. Should be the same in the
                                         # same order for all clients
-                 class_weights: Optional[Dict[Any, float]] = None,
+                 class_weights: Optional[Dict[Any, float]],
                     # weights of the classes (dict[class]=weight)
                  ) -> None:
         self.max_depth = max_depth
@@ -164,6 +195,8 @@ class DecisionTree:
         self.mode = mode
         self.global_classes = global_classes
         self.class_weights = class_weights
+        if self.mode == 'regression' and self.class_weights is not None:
+            raise ValueError('Weights are not supported for regression.')
 
         # init the root node
         self.root = Node(depth=0,
@@ -183,6 +216,36 @@ class DecisionTree:
         """
         return np.array([self._traverse_tree(x, self.root) for x in X])
 
+    def iterate_cur_depth_nodes(self) -> Iterator["Node"]:
+        """
+        Iterate over the nodes at the current depth.
+        """
+        for node in self.cur_depth_nodes:
+            yield node
+
+    def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> List[List[List[float]]]:
+        """
+        Calculate the score of a split for each feature and bin. Works on the cur_depth_nodes.
+        If they already have an assigned feature and threshold, an error is thrown.
+
+        Args:
+            X_hist: input data, 2d array of shape (n_samples, n_features).
+                The values are NOT the actual values but the bin indices the samples belong to
+                for each feature.
+            y: target data, 1d array of shape (n_samples), indicating the target value
+                for each sample
+            n_bins: number of bins to consider for each feature.
+
+        Returns:
+            scores: 3d array of shape (num_nodes_cur_level, len(self.feat_idcs), n_bins),
+            containing the score of a split per feature and bin.
+        """
+        scores = []
+        for node in self.cur_depth_nodes:
+            node_scores = node.get_split_scores(X_hist, y, n_bins)
+            scores.append(node_scores)
+        return scores
+
     def _traverse_tree(self, x, node):
         """
         Traverse the tree to find the leaf node for the input data x, effectively making a prediction.
@@ -192,7 +255,6 @@ class DecisionTree:
         if x[node.feature] <= node.threshold:
             return self._traverse_tree(x, node.left)
         return self._traverse_tree(x, node.right)
-
 
 class Node:
     """
@@ -205,17 +267,20 @@ class Node:
                  global_classes: np.ndarray, # global classes. Should be the same in the
                                              # same order for all clients
                  feature_idcs: np.ndarray, # List of feature indices for each tree,
-                 class_weights: Optional[Dict[Any, float]] = None, # weights of the classes (dict[class]=weight)
+                 class_weights: Optional[Dict[Any, float]],
+                    # weights of the classes: (dict[class]=weight)
                  feature: Optional[int] = None, # the feature index used in this node
                  threshold: Optional[Union[float, int]] = None,
-                    # the threshold whether to go left or right. The decision is x <= threshold #TODO: right?
+                    # the threshold whether to go left or right. The decision is x <= threshold
+                    #TODO: right? Wait maybe we need the info if we're right or left
                  score: Optional[float] = None, # the score (e.g. gini impurity) of the split
                  parent: Optional["Node"] = None, # pointer to the parent node
                  left: Optional["Node"] = None, # pointer to the left child
                  right: Optional["Node"] = None, # pointer to the right child
                  global_leaf: bool = False, # whether the node is a leaf globally
                  local_leaf: bool = False, # whether the node is a leaf locally #TODO: how is the local/global leaf determined?
-                 value=None):
+                 value=None #TODO: what is the value?
+                 ) -> None:
         self.depth = depth
         self.sample_idcs = sample_idcs
         self.feature = feature
@@ -237,7 +302,7 @@ class Node:
         self.mode = mode
         for cl in global_classes:
             if cl not in class_weights:
-                raise ValueError('Class weights must be given for all classes.')
+                raise ValueError('Class weights must be given for all classes or not at all')
         self.class_weights = class_weights
 
     def is_leaf_node(self):
@@ -246,123 +311,146 @@ class Node:
         """
         return self.global_leaf
 
-    def get_split_score(self, X, y):
+    def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> List[List[float]]:
         """
-        Calculate the score of a split for each feature and threshold.
+        Calculate the score of a split for each feature and bin.
+        Throws an error if the node alreadt has a set feature and threshold.
+
+        Args:
+            X_hist: input data, 2d array of shape (n_samples, n_features).
+                The values are NOT the actual values but the bin indices the samples belong to
+                for each feature.
+            y: target data, 1d array of shape (n_samples), indicating the target value
+                for each sample
+            n_bins: number of bins to consider for each feature.
+
+        Returns:
+            scores: 2d array of shape (len(self.feature_idcs), n_bins), containing the score of a split per
+                feature and bin.
         """
+        if self.feature is not None or self.threshold is not None:
+            raise ValueError('Node already has a split.')
+        # ensure input data formatting
+        if len(X_hist.shape) != 2:
+            raise ValueError('X_hist must be a 2d array.')
+        if X_hist.shape[1] != len(y):
+            raise ValueError('X_hist and y must have the same number of samples.')
+        if len(y.shape) != 1:
+            raise ValueError('y must be a 1d array.')
+        node_data = X_hist[self.sample_idcs]
+        scores = []
+            # num_features x num_bins
         for feature_idx in self.feature_idcs:
-            # TODO: CONTINUE HERE
+            feature_data = node_data[:, feature_idx]
+            scores_per_bin = []
+                # array of length num_bins containing the scores per_bin
+            for bin_idx in range(n_bins):
+                # we split the data into <= threshold and > threshold
+                left_idxs = np.where(feature_data <= bin_idx)[0]
+                    # feature_data <= bin_idx returns a boolean array
+                    # np.where then returns the indices of the True values
+                    # we need to add [0] as np.where always returns a tuple
+                right_idxs = np.where(feature_data > bin_idx)[0]
+                left_y = y[left_idxs]
+                right_y = y[right_idxs]
+                if self.mode == 'classification':
+                    # Each node is a binary split, we just check that the impurity is minimized
+                    score = self._gini_split_score(left_y, right_y)
+                else: # regression
+                    score = self._mse_split_score(left_y, right_y)
+                scores_per_bin.append(score)
+            scores.append(scores_per_bin)
+        return scores
 
+    def _gini_split_score(self, left_y: np.ndarray, right_y: np.ndarray) \
+            -> np.floating:
+        """
+        Calculate the gini impurity of one specific split. This is done by calculating the
+        gini impurity of the left and right node and then weighting them by the number of samples
+        that each child node would contain.
+        Formula is:
+            gini_split = #samples_left / #samples_total_split * gini_left +
+                #samples_right / #samples_total_split * gini_right
+            gini_left and right are calculated via the gini impurity formula:
+            gini_impurity = 1 - sum(p_i^2), where p_i is the probability of class i
+        practically, this is calculated as:
+            gini_impurity = 1 - sum_class_i((#samples_of_class_i / #samples)^2)
+            This is done for both the left and right node, also only using the samples that
+            would end up in the respective node!!
 
+        if weights are given, then we go from each sample being represented by a one
+        to each sample being represented by it's weight.
+        This changes especially the calculations that previously only took counts of samples into
+        account. Instead, they now use the accumulated weights of samples.
+        1. The gini impurity calculation changes:
+            gini_impurity = 1 -
+                sum_class_i((sum_weight_of_samples_of_class_i / sum_weight_of_all_samples)^2)
+        2. The gini score formula changes:
+            gini = sum_weight_of_samples_left / sum_weight_of_samples * gini_left +
+                sum_weight_of_samples_right / sum_weight_of_samples * gini_right
 
-#TODO: include the following functions in the Node class
-def split_score(X, y, feat_idxs, n_bins, mode, classes, weights=None):
-    """
-    Calculate the score of a split for each feature and threshold.
+        Args:
+            left_y: target values of the samples that would end up in the left node
+            right_y: target values of the samples that would end up in the right node
 
-    Args:
-        X: input data
-        y: target data
-        feat_idxs: indices of the features to be considered
-        n_bins: number of bins to consider for each feature
-        mode: classification or regression
-        classes: classes of the classification
-        weights: weights of the samples, if None, no weighting is done
-            If weights is given, should be a dictionary with the class as key
-            and the weight as value
-    """
-    n_classes = len(classes)
-        # these are the global classes
-    local_score = []
-        # dimensionality is feat_idxs x n_bins
-    for feat_idx in feat_idxs:
-        X_column = X[:, feat_idx]
-        tmp_feat = []
-        for thr in range(n_bins):
-            left_idxs, right_idxs = _split(X_column, thr)
-            left_y = y[left_idxs]
-            right_y = y[right_idxs]
-            if mode == 'classification':
-                # we assume only 2 classes exist
-                # this is why we simply have left and right
-                len_y = len(y) if weights is None else np.sum(np.vectorize(weights.get)(y))
-                    # if we have weights, we sum up the weights of the samples
-                    # otherwise we just take the number of samples
-                score = _gini_split(left_y, right_y, n_classes, len_y, weights=weights)
-            else:
-                if weights is not None:
-                    raise ValueError('Weights are not supported for regression.')
-                score = _mse_split(y, left_y, right_y)
-            tmp_feat.append(score)
-        local_score.append(tmp_feat)
-    return local_score
+        Returns:
+            gini: the gini impurity of the split
+        """
+        if len(left_y.shape) != 1 or len(right_y.shape) != 1:
+            raise ValueError('y must be a 1d array.')
+        left_weights = np.ones((len(left_y))) if self.class_weights is None else np.vectorize(self.class_weights.get)(left_y)
+            # either just one for any sample or the weight of the sample by their class
+            # np.vectorize(self.class_weights.get)(left_y) runs weights.get on each element
+            # of left_y constructing an np.array. we therefore get an np.array of length samples
+            # with the weight for each sample as values.
+        right_weights = np.ones((len(right_y))) if self.class_weights is None else np.vectorize(self.class_weights.get)(right_y)
+        total_left = np.sum(left_weights)
+        total_right = np.sum(right_weights)
+        total_y = total_left + total_right
 
-def _split(X_column, split_thr):
-    # the values in X mean membership of the sample to the bin (0, 1, 2, ...)
-    # the left_idxes are the indices part of this bin and all bins to the left
-    # the right_idxes are the indices part of all bins to the right
-    left_idxs = np.where(X_column <= split_thr)[0]
-    right_idxs = np.where(X_column > split_thr)[0]
-    return left_idxs, right_idxs
+        gini_left = 1.0 - np.sum((np.bincount(left_y.astype('int'), minlength=self.num_classes, weights=left_weights) / total_left) ** 2)
+            # with np.bincount we get an array of length n_classes with the index being the specific
+            # class. The values are the added weights of the samples of each class.
+            # if self.class_weights is None, we just add one for each sample, so we have the
+            # counts of samples of each class
+            # we then divide by the total weight/total number of samples
+            # to get the probability of each class
+        gini_right = 1.0 - np.sum((np.bincount(right_y.astype('int'), minlength=self.num_classes, weights=right_weights) / total_right) ** 2)
+        gini = (total_left / total_y) * gini_left + (total_right / total_y) * gini_right
+            # we add the two gini impurities weighted by the number of samples/weights by total weight
+        return gini
 
-def _gini_split(left_y: np.ndarray, right_y: np.ndarray,
-                n_classes: int, total_y: int,
-                weights: Union[None, Dict[Union[int, str], int]]=None) -> np.floating:
-    """
-    Calculate the gini impurity of a split.
-    Formula is:
-        gini = #samples_left / #samples * gini_left + #samples_right / #samples * gini_right
-        gini_left and right are calculated via the gini impurity formula:
-        gini_impurity = 1 - sum(p_i^2), where p_i is the probability of class i
-    practically, this is calculated as:
-        gini_impurity = 1 - sum_class_i((#samples_of_class_i / #samples)^2)
-    if weights are given, then we go from each sample being represented by a one
-    to each sample being represented by it's weight.
-    This changes especially the calculations that previously only took the number
-    of samples into using the accumulated weight of these samples.
-    1. The gini impurity calculation changes:
-        gini_impurity = 1 - sum_class_i((sum_weight_of_samples_of_class_i / sum_weight_of_samples)^2)
-    2. The gini score formula changes:
-        gini = sum_weight_of_samples_left / sum_weight_of_samples * gini_left + sum_weight_of_samples_right / sum_weight_of_samples * gini_right
+    def _mse_split_score(self, left_y: np.ndarray, right_y: np.ndarray) -> np.floating:
+        """
+        Calculates the mean squared error of a split. This is done similarly to the gini impurity
+        split score. We calculate the mean squared error of the left and right node and then weight
+        them by the number of samples that each child node would contain.
+        Formula is:
+            mse_split = #samples_left / #samples_total_split * mse_left +
+                #samples_right / #samples_total_split * mse_right
+            mse_left and right are calculated via the mse formula:
+            mse = 1/n * sum((y_node - mean(y_node))^2), where y_node are the target values of the
+                samples in the right/left node.
+        Weights are not supported for regression.
 
-    Args:
-        left_y: y values of the left node
-        right_y: y values of the right node
-        n_classes: number of classes
-        total_y: number of samples in the parent node. If weights are given,
-            this is the sum of the weights over all samples
-        weights: weights of the samples, if None, no weighting is done
-    Returns:
-        gini score of the split
-    """
-    if len(left_y) == 0 or len(right_y) == 0:
-        return np.float64(1.0)
-    left_weights = None if weights is None else np.vectorize(weights.get)(left_y)
-        # runs weights.get on each element of left_y constructing an np.array
-        # we therefore get an np.array of length samples with the weight for
-        # each sample as values
-    total_left = len(left_y) if left_weights is None else np.sum(left_weights)
-    gini_left = 1.0 - np.sum((np.bincount(left_y.astype('int'), minlength=n_classes, weights=left_weights) / total_left) ** 2)
-        # with np.bincount we get an array of length n_classes with the number of
-        # samples of each class as values and the index as the class
-        # we then divide by the number of samples to get the probability of each class
-        # if we have weights, we add up the weights of the samples of each class
-        # instead of adding one for each sample
-    right_weights = None if weights is None else np.vectorize(weights.get)(right_y)
-    total_right = len(right_y) if right_weights is None else np.sum(right_weights)
-    gini_right = 1.0 - np.sum((np.bincount(right_y.astype('int'), minlength=n_classes, weights=right_weights) / total_right) ** 2)
-    gini = (total_left / total_y) * gini_left + (total_right / total_y) * gini_right
-        # we add the two gini impurities weighted by the number of samples/weights by total weight
-    return gini
+        Args:
+            left_y: target values of the samples that would end up in the left node
+            right_y: target values of the samples that would end up in the right node
 
-def _mse_split(y, left_y, right_y):
-    parent_mse = _mse(y)
-    if len(left_y) == 0 or len(right_y) == 0:
-        return parent_mse
-    left_mse = _mse(left_y)
-    right_mse = _mse(right_y)
-    mse = parent_mse - 1/len(y) * (len(left_y) * left_mse + len(right_y) * right_mse)
-    return mse
+        Returns:
+            mse: the mean squared error of the split
+        """
+        if len(left_y.shape) != 1 or len(right_y.shape) != 1:
+            raise ValueError('y must be a 1d array.')
+        if self.class_weights is not None:
+            raise ValueError('Weights are not supported for regression.')
 
-def _mse(y):
-    return np.mean(np.square(y - np.mean(y)))
+        total_left = len(left_y)
+        total_right = len(right_y)
+        total_y = total_left + total_right
+
+        mse_left = np.mean((left_y - np.mean(left_y)) ** 2)
+            # np.mean(x) is the same then np.sum(x) / total_left
+        mse_right = np.mean((right_y - np.mean(right_y)) ** 2)
+        mse = (total_left / total_y) * mse_left + (total_right / total_y) * mse_right
+        return mse

@@ -91,13 +91,46 @@ class InitialState(AppState):
         client.set_available_classes(classes)
         client.set_class_weights(weights)
         client.init_forest()
+
+        # Build the trees iteratively
+        while True:
+            # we stop via the stopping criteria
+            #TODO: stopping criteria final here
+
+            ### We build the current depth of the trees
+
+            #TODO: rewrite the following part, as we need to calculate the splitscores
+            # differently, see the Missing bugs to fix comment
+            # local scores
+            local_scores = client.get_current_level_splitscores()
+                #TODO: how to manage leaf nodes? Before we did this:
+                # if leaf:
+                # local_split_score = [[0] * n_bins for _ in range(len(decision_tree.feat_idcs))]
+            self.send_data_to_coordinator(local_scores)
+                # clients x splits x trees x nodes_current_depth x feature x n_bins
+
+
+            if self.is_coordinator:
+                # local_scores -> global_scores
+
+
+
+
         #TODO: continue here
         # Missing bugs to fix:
+        # the splitscore calculation is wrong right now.
+        # Consider the following for the gini impurity formula:
+        # gini = #samples_left / #samples_total * (1 - sum_class_i(#samples_left_class_i/#samples_left)**2) + right...
+        # To correctly calculate this in a federated setting, we can send the following to the coordinator:
+        #   #samples_left_class_i for each class, feature and bin (weights can easily be calced from it) (+ right side)
+        # then we can calculate the gini impurity for each client and sum it up at the coordinator
+
+
         # The splitscore should be calculated correctly using the correct sampleset, not always
         # the full decision trees sampleset
-        # The aggregation of the splitscores should take into account the number of samples correctly
-        # (right now all clients are weighted equally)
-        # Potentially bugs in the stopping criteria?
+        # for that we need to ensure when adding a new node to the tree that the sampleset is
+        # correctly updated!!!
+
 
 
 
@@ -109,58 +142,6 @@ class InitialState(AppState):
 
 
         return 'terminal'
-
-@app_state('find_local_splits', Role.BOTH)
-class LocalSplitState(AppState):
-    """
-    Each participants calculates split score for each feature-threshold combination and send the
-    split scores to the coordinator.
-    """
-
-    def register(self):
-        self.register_transition('aggregate_splits', Role.BOTH)
-
-    def run(self):
-        rf_models = self.load('rf_models')
-        X_hist = self.load('X_hist')
-        y = self.load('y')
-        n_bins = self.load('n_bins')
-        local_splits = []
-            # split x tree x nodes_current_depth x feature x n_bins
-
-        for split in range(len(X_hist)):
-            tmp_split = []
-            rf_model = rf_models[split]
-            if not rf_model.finished:
-                for decision_tree in rf_model.decision_trees:
-                    tmp_dt = []
-                    if not decision_tree.finished:
-                        depth_nodes = decision_tree.cur_depth_nodes
-                        for node in depth_nodes:
-                            if not node.local_leaf:
-                                local_split_score = split_score(X_hist[split][decision_tree.samples],
-                                                y[split][decision_tree.samples],
-                                                decision_tree.feat_idcs,
-                                                n_bins,
-                                                self.load('prediction_mode'),
-                                                classes=self.load('classes'),
-                                                weights=self.load('weights')[split])
-                            else:
-                                # leaf node
-                                local_split_score = [[0] * n_bins for _ in \
-                                                     range(len(decision_tree.feat_idcs))]
-                                # we set the score of 0 for leaf nodes
-                                # dimensionality needs to fit, we have
-                                # feat_idcs x n_bins
-                            tmp_dt.append(local_split_score)
-                    if len(tmp_dt) > 0:
-                        tmp_split.append(tmp_dt)
-            if len(tmp_split) > 0:
-                local_splits.append(tmp_split)
-        self.send_data_to_coordinator(local_splits)
-            # split x tree x nodes_current_depth x feature x n_bins
-
-        return 'aggregate_splits'
 
 
 @app_state('aggregate_splits', Role.BOTH)
@@ -181,6 +162,7 @@ class AggregateSplitState(AppState):
             data = self.gather_data()
                 # split x tree x nodes_current_depth x feature x n_bins
             global_splits = []
+                # split x tree x nodes_current_depth x feature x [feature, threshold, score]
             counter_split = 0
 
             for split in range(len(self.load('X_hist'))):
@@ -195,9 +177,12 @@ class AggregateSplitState(AppState):
                             for node in range(len(nodes)):
                                 split_scores = [np.array(data[i][counter_split][counter_dt][node]) \
                                         for i in range(len(data))]
+                                    # clients x features x n_bins
                                 sum_split_score = np.sum(split_scores, axis=0)
+                                    # features x n_bins
                                 best_split = [np.unravel_index(np.argmin(sum_split_score), \
                                             sum_split_score.shape), np.min(sum_split_score)]
+                                    #
                                 tmp_dt.append(best_split)
                             counter_dt = counter_dt + 1
                             tmp_split.append(tmp_dt)
