@@ -1,4 +1,4 @@
-from typing import Optional, Union, Dict, Any, List, Iterator
+from typing import Optional, Union, Dict, Any, List, Iterator, Tuple
 
 import numpy as np
 from scipy import stats
@@ -143,7 +143,8 @@ class RandomForest:
         for tree in self.decision_trees:
             yield tree
 
-    def get_split_scores(self, X_Hist: np.ndarray, y: np.ndarray, n_bins: int) -> List[List[List[List[float]]]]:
+    def get_split_scores(self, X_Hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
+            Tuple[List[List[List[List[float]]]], List[List[List[int]]]]:
         """
         Calculate the score of a split for each feature and bin. Works on the cur_depth_nodes.
         If they already have an assigned feature and threshold, an error is thrown.
@@ -159,12 +160,16 @@ class RandomForest:
         Returns:
             scores: 4d array of shape (n_estimators, num_nodes_cur_level,
             len(self.feat_idcs), n_bins), containing the score of a split per feature and bin.
+            counts: 3d array of shape (n_estimators, num_nodes_cur_level, len(self.feat_idcs)),
+                containing the counts of samples for each feature and node per tree
         """
         scores = []
+        counts = []
         for tree in self.decision_trees:
-            tree_scores = tree.get_split_scores(X_Hist, y, n_bins)
+            tree_scores, tree_counts = tree.get_split_scores(X_Hist, y, n_bins)
             scores.append(tree_scores)
-        return scores
+            counts.append(tree_counts)
+        return scores, counts
 
 
 class DecisionTree:
@@ -223,7 +228,8 @@ class DecisionTree:
         for node in self.cur_depth_nodes:
             yield node
 
-    def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> List[List[List[float]]]:
+    def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
+            Tuple[List[List[List[float]]], List[List[int]]]:
         """
         Calculate the score of a split for each feature and bin. Works on the cur_depth_nodes.
         If they already have an assigned feature and threshold, an error is thrown.
@@ -237,14 +243,18 @@ class DecisionTree:
             n_bins: number of bins to consider for each feature.
 
         Returns:
-            scores: 3d array of shape (num_nodes_cur_level, len(self.feat_idcs), n_bins),
+            scores: 3d list of dimensions (num_nodes_cur_level, len(self.feat_idcs), n_bins),
             containing the score of a split per feature and bin.
+            counts: 2d list of dimensions (num_nodes_cur_level, len(self.feat_idcs)), containing
+                the counts of samples for each feature and node
         """
         scores = []
+        counts = []
         for node in self.cur_depth_nodes:
-            node_scores = node.get_split_scores(X_hist, y, n_bins)
+            node_scores, node_counts = node.get_split_scores(X_hist, y, n_bins)
             scores.append(node_scores)
-        return scores
+            counts.append(node_counts)
+        return scores, counts
 
     def _traverse_tree(self, x, node):
         """
@@ -311,7 +321,8 @@ class Node:
         """
         return self.global_leaf
 
-    def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> List[List[float]]:
+    def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
+            Tuple[List[List[float]], List[int]]:
         """
         Calculate the score of a split for each feature and bin.
         Throws an error if the node alreadt has a set feature and threshold.
@@ -327,7 +338,16 @@ class Node:
         Returns:
             scores: 2d array of shape (len(self.feature_idcs), n_bins), containing the score of a split per
                 feature and bin.
+            counts: list of length len(self.feature_idcs), containing the counts of samples for each feature
         """
+        # TODO: possible optimization:
+        # the splitscore calculation is wrong right now.
+        # Consider the following for the gini impurity formula:
+        # gini = #samples_left / #samples_total * (1 - sum_class_i(#samples_left_class_i/#samples_left)**2) + right...
+        # To correctly calculate this in a federated setting, we could exchange #samples_left
+        # and #samples_right per client with the coordinator to aggregate it, then broadcast it
+        # back to the clients and use it to calculate the gini impurity. If weighting is used,
+        # we could instead exchange the corresponding weightsums.
         if self.feature is not None or self.threshold is not None:
             raise ValueError('Node already has a split.')
         # ensure input data formatting
@@ -340,6 +360,8 @@ class Node:
         node_data = X_hist[self.sample_idcs]
         scores = []
             # num_features x num_bins
+        counts = []
+            # list of length num_features, containing the counts of samples for each feature
         for feature_idx in self.feature_idcs:
             feature_data = node_data[:, feature_idx]
             scores_per_bin = []
@@ -360,7 +382,8 @@ class Node:
                     score = self._mse_split_score(left_y, right_y)
                 scores_per_bin.append(score)
             scores.append(scores_per_bin)
-        return scores
+            counts.append(len(feature_data))
+        return scores, counts
 
     def _gini_split_score(self, left_y: np.ndarray, right_y: np.ndarray) \
             -> np.floating:

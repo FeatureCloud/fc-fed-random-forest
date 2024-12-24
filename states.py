@@ -93,39 +93,42 @@ class InitialState(AppState):
         client.init_forest()
 
         # Build the trees iteratively
+        counter = 0
         while True:
+            counter += 1
             # we stop via the stopping criteria
-            #TODO: stopping criteria final here
+            #TODO: stopping criteria management here
 
             ### We build the current depth of the trees
-
-            #TODO: rewrite the following part, as we need to calculate the splitscores
-            # differently, see the Missing bugs to fix comment
             # local scores
-            local_scores = client.get_current_level_splitscores()
+            local_scores, local_counts = client.get_current_level_splitscores()
                 #TODO: how to manage leaf nodes? Before we did this:
                 # if leaf:
                 # local_split_score = [[0] * n_bins for _ in range(len(decision_tree.feat_idcs))]
-            self.send_data_to_coordinator(local_scores)
+            self.send_data_to_coordinator([local_scores, local_counts], memo=f"local_scores_{counter}")
                 # clients x splits x trees x nodes_current_depth x feature x n_bins
 
 
             if self.is_coordinator:
                 # local_scores -> global_scores
+                result = self.gather_data(memo=f"local_scores_{counter}")
+                global_split_scores = client.coord_aggregate_split_scores(client_split_scores=\
+                                                        [result[i][0] for i in range(len(result))],
+                                                    sample_count_per_client=\
+                                                        [result[i][1] for i in range(len(result))])
+                self.broadcast_data(global_split_scores, send_to_self=True)
+
+            # TODO: continue here
+            # equivalent in the old code is in aggregate_splits after the self.broadcast_data(global_splits, send_to_self=False)
+            # careful, here is where node.samples MUST be set correctly!!!
+            # It should be set for the current depth nodes, then after the stopping criteria stuff
+            # we should set the next depth nodes and their samples correctly
 
 
 
 
-        #TODO: continue here
+        #TODO:
         # Missing bugs to fix:
-        # the splitscore calculation is wrong right now.
-        # Consider the following for the gini impurity formula:
-        # gini = #samples_left / #samples_total * (1 - sum_class_i(#samples_left_class_i/#samples_left)**2) + right...
-        # To correctly calculate this in a federated setting, we can send the following to the coordinator:
-        #   #samples_left_class_i for each class, feature and bin (weights can easily be calced from it) (+ right side)
-        # then we can calculate the gini impurity for each client and sum it up at the coordinator
-
-
         # The splitscore should be calculated correctly using the correct sampleset, not always
         # the full decision trees sampleset
         # for that we need to ensure when adding a new node to the tree that the sampleset is

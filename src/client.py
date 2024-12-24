@@ -556,7 +556,8 @@ class FedHistRandomForestClient():
                                 if self.class_weights else None)
             self.rf_models.append(rf_model)
 
-    def get_current_level_splitscores(self) -> List[List[List[List[List[float]]]]]:
+    def get_current_level_splitscores(self) -> Tuple[List[List[List[List[List[float]]]]],
+                                                    List[List[List[List[int]]]]]:
         """
         Returns the split scores of all RandomForest models. Only calculates the one of the current
         level of each tree. Throws an error if the current level is already set, except if the
@@ -566,17 +567,21 @@ class FedHistRandomForestClient():
             scores: List[List[List[List[List[float]]]]] (splits x n_estimators x n_nodes x
                 n_features x n_bins):
                 The scores of the trees for the current level of all possible splits by bins
+            counts: List[List[List[List[int]]]] (splits x n_estimators x n_nodes x n_features):
         """
         if not self.rf_models:
             raise ValueError('The forest has not been initialized yet')
         if not self.X_hist:
             raise ValueError('Binning information must be set before calculating split scores')
         scores = []
+        counts = []
         for split_idx, rf_model in enumerate(self.rf_models):
-            scores.append(rf_model.get_split_scores(X_Hist=self.X_hist[split_idx],
+            score, count = rf_model.get_split_scores(X_Hist=self.X_hist[split_idx],
                                                     y=self.y[split_idx],
-                                                    n_bins=self.n_bins))
-        return scores
+                                                    n_bins=self.n_bins)
+            scores.append(score)
+            counts.append(count)
+        return scores, counts
 
     def coord_ensure_config_alignment(self,
                                       feature_names: List[List[str]],
@@ -835,8 +840,8 @@ class FedHistRandomForestClient():
 
     def coord_aggregate_split_scores(self,
                                      client_split_scores: List[List[List[List[List[float]]]]],
-                                     sample_count_per_client: List[int]) \
-            ->
+                                     sample_count_per_client: List[List[List[List[List[int]]]]]) \
+            -> List[List[List[Tuple[int, int, float]]]]:
         """
         Aggregates the split scores from all clients to a global split score.
         The split score per client was calculated by self.get_current_level_splitscores.
@@ -846,73 +851,48 @@ class FedHistRandomForestClient():
             (clients x splits x n_estimators x n_nodes x
                 n_features x n_bins):
                 The scores of the trees for the current level of all possible splits by bins
-            sample_count_per_client: List[int] (clients):
-                The sample count per client. Same order of clients as client_split_scores.
+            sample_count_per_client: List[List[List[List[List[int]]]]]
+                (clients x splits x n_estimators x n_nodes x n_features):
+                The sample counts per client. Same order of clients as client_split_scores.
         Returns:
-
+            global_split_scores: List[List[List[Tuple[int, int, float]]]]
+                (splits x n_estimators x n_nodes x (feature_idx, bin_idx, score)):
         """
         if not self.rf_models:
             raise ValueError('The forest has not been initialized yet')
         if not self.X_hist:
             raise ValueError('Binning information must be set before calculating split scores')
+
         global_split_scores = []
             # split x n_estimators x n_nodes x (feature_idx, bin_idx, score)
-        total_samples = np.sum(sample_count_per_client)
+        total_samples = np.sum(sample_count_per_client, axis=0)
+            # collapse sample axis, new dimensions are:
+            # splits x n_estimators x n_nodes x n_features
         for split_idx, _ in enumerate(self.X_hist):
+            tree_scores = []
             for tree_idx, tree in enumerate(self.rf_models[split_idx].iterate_trees()):
+                node_scores = []
                 for node_idx, node in enumerate(tree.iterate_cur_depth_nodes()):
                     # extract the relevant split scores
                     split_scores = [d[split_idx][tree_idx][node_idx] for d in client_split_scores]
                         # clients x features x n_bins
-                    # aggregate over the clients, taking into account the sample count
-                    sum_split_score = np.sum(split_scores * np.array([samples_client/total_samples for samples_client in sample_count_per_client]) , axis=0)
-
-
-
-                    split_scores = [d[split_idx][tree_idx][node_idx] for d in client_split_scores]
-                        # clients x features x n_bins
-                    sum_split_score = np.sum(split_scores, axis=0)
+                    sample_counts = [c[split_idx][tree_idx][node_idx] for c  in sample_count_per_client]
+                        # clients x features
+                    total_counts = np.sum(sample_counts, axis=0)
+                    ratios = np.divide(sample_counts, total_samples)
+                        # this is the weight to use for the relevant client
+                    # sum up the split scores considering the weights
+                    sum_split_score = np.sum([split_scores[i] * ratios[i] for i in range(len(split_scores))], axis=0)
                         # features x n_bins
-                    best_split = [np.unravel_index(np.argmin(sum_split_score), sum_split_score.shape),
-                                  np.min(sum_split_score)]
-                        # Array: [(feature_idx, bin_idx), score]
-                    global_split_scores.append(best_split)
+                    if len(sum_split_score) != 2:
+                        raise ValueError('Split score must have length 2')
+                    feature_idx, bin_idx = np.unravel_index(np.argmin(sum_split_score), sum_split_score.shape)
+                    min_score = np.min(sum_split_score)
+                    node_scores.append((feature_idx, bin_idx, min_score))
+                tree_scores.append(node_scores)
+            global_split_scores.append(tree_scores)
 
-
-
-                if self.is_coordinator:
-            rf_models = self.load('rf_models')
-            data = self.gather_data()
-                # split x tree x nodes_current_depth x feature x n_bins
-            global_splits = []
-                # split x tree x nodes_current_depth x feature x [feature, threshold, score]
-            counter_split = 0
-
-            for split in range(len(self.load('X_hist'))):
-                rf_model = rf_models[split]
-                tmp_split = []
-                if not rf_model.finished:
-                    counter_dt = 0
-                    for decision_tree in rf_model.decision_trees:
-                        tmp_dt = []
-                        if not decision_tree.finished:
-                            nodes = decision_tree.cur_depth_nodes
-                            for node in range(len(nodes)):
-                                split_scores = [np.array(data[i][counter_split][counter_dt][node]) \
-                                        for i in range(len(data))]
-                                    # clients x features x n_bins
-                                sum_split_score = np.sum(split_scores, axis=0)
-                                    # features x n_bins
-                                best_split = [np.unravel_index(np.argmin(sum_split_score), \
-                                            sum_split_score.shape), np.min(sum_split_score)]
-                                    # Array: [(feature_idx, bin_idx), score]
-                                tmp_dt.append(best_split)
-                            counter_dt = counter_dt + 1
-                            tmp_split.append(tmp_dt)
-                    counter_split = counter_split + 1
-                    if len(tmp_split) > 0:
-                        global_splits.append(tmp_split)
-            self.broadcast_data(global_splits, send_to_self=False)
+        return global_split_scores
 
     def _read_config(self, config: dict):
         """
