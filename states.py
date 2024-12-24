@@ -133,6 +133,8 @@ class InitialState(AppState):
         # the full decision trees sampleset
         # for that we need to ensure when adding a new node to the tree that the sampleset is
         # correctly updated!!!
+        # Also, the predict function of the RF was never double checked, it might still have
+        # e.g. indexing errors and might not work with the new structure of the model
 
 
 
