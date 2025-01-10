@@ -32,78 +32,81 @@ class RandomForest:
                  class_weights: Optional[Dict[Any, float]],
                     # weights of the classes (dict[class]=weight)
                 ) -> None:
-        self.n_estimators = n_estimators
-        self.max_samples = max_samples
-        self.feat_idcs = feat_idcs
-        self.max_depth = max_depth
-        self.min_samples_split = min_samples_split
-        self.min_samples_leaf = min_samples_leaf
-        self.n_patients_local = n_patients_local
-        self.n_patients_global = n_patients_global
-        self.bootstrap = bootstrap
-        self.random_state = random_state
-        self.decision_trees: List[DecisionTree] = []
+        # private vars
+        self.__max_samples = max_samples
+        self.__feat_idcs = feat_idcs
+        self.__max_depth = max_depth
+        self.__min_samples_split = min_samples_split
+        self.__min_samples_leaf = min_samples_leaf
+        self.__n_patients_local = n_patients_local
+        self.__n_patients_global = n_patients_global
+        self.__bootstrap = bootstrap
+        self.__random_state = random_state
+        self.__decision_trees: List[DecisionTree] = []
         np.random.seed(random_state)
-        self.quantile = quantile
-        self.global_mean = global_mean
-        self.global_stddev = global_stddev
-        self.split_points = split_points
-        self.prediction_mode = prediction_mode
-        self.global_classes = global_classes
-        self.class_weights = class_weights
-        self.oob = oob
+        self.__quantile = quantile
+        self.__global_mean = global_mean
+        self.__global_stddev = global_stddev
+        self.__split_points = split_points
+        self.__global_classes = global_classes
+        self.__class_weights = class_weights
+        self.__oob = oob
         self.finished = False
+
+        # public vars
+        self.prediction_mode = prediction_mode
+        self.n_estimators = n_estimators
 
         # init the trees
         for _ in range(self.n_estimators):
-            sample_idcs = self._bootstrap_samples()
+            sample_idcs = self.__bootstrap_samples()
             tree = DecisionTree(samples_idcs=sample_idcs,
-                                max_depth=self.max_depth,
-                                min_samples_split=self.min_samples_split,
-                                min_samples_leaf=self.min_samples_leaf,
-                                feat_idcs=self.feat_idcs,
+                                max_depth=self.__max_depth,
+                                min_samples_split=self.__min_samples_split,
+                                min_samples_leaf=self.__min_samples_leaf,
+                                feat_idcs=self.__feat_idcs,
                                 mode=self.prediction_mode,
-                                global_classes=self.global_classes,
-                                class_weights=self.class_weights)
-            self.decision_trees.append(tree)
+                                global_classes=self.__global_classes,
+                                class_weights=self.__class_weights)
+            self.__decision_trees.append(tree)
 
-    def _bootstrap_samples(self):
-        sample_size = max(round(self.n_patients_local * self.max_samples), 1)
-        sample_idcs = np.random.choice(self.n_patients_local, sample_size, replace=self.bootstrap)
+    def __bootstrap_samples(self):
+        sample_size = max(round(self.__n_patients_local * self.__max_samples), 1)
+        sample_idcs = np.random.choice(self.__n_patients_local, sample_size, replace=self.__bootstrap)
         return sample_idcs
 
     def predict(self, X):
         #TODO: double check this, this funcction was not verified!!!
-        bucket_idcs = np.setdiff1d(np.arange(len(X[0])), self.quantile)
+        bucket_idcs = np.setdiff1d(np.arange(len(X[0])), self.__quantile)
 
         if len(bucket_idcs) > 0:
             # Bucket Binning
-            bucket_split_points = self.split_points[bucket_idcs, :]
+            bucket__split_points = self.__split_points[bucket_idcs, :]
 
             X_T_bucket = np.transpose(X[:, bucket_idcs])
             # Assign data points to bins
-            X_hist_bucket = np.array([np.digitize(X_T_bucket[i], bucket_split_points[i]) \
+            X_hist_bucket = np.array([np.digitize(X_T_bucket[i], bucket__split_points[i]) \
                                         for i in range(X_T_bucket.shape[0])]) - 1
 
-        if len(self.quantile) > 0:
+        if len(self.__quantile) > 0:
             # Quantile Binning
-            a = (X[:, self.quantile] - self.global_mean)
-            b = self.global_stddev
+            a = (X[:, self.__quantile] - self.__global_mean)
+            b = self.__global_stddev
             normalized = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
             normalized[normalized == np.inf] = 0
             normalized[normalized == -np.inf] = 0
             normalized[normalized == np.nan] = 0
 
-            quantile_split_points = self.split_points[self.quantile, :]
-            X_T_quantile = np.transpose(normalized)
+            quantile__split_points = self.__split_points[self.__quantile, :]
+            X_T__quantile = np.transpose(normalized)
             # Assign data points to bins
-            X_hist_quantile = np.array([np.digitize(X_T_quantile[i], quantile_split_points[i]) \
-                                        for i in range(X_T_quantile.shape[0])])
+            X_hist__quantile = np.array([np.digitize(X_T__quantile[i], quantile__split_points[i]) \
+                                        for i in range(X_T__quantile.shape[0])])
 
-        if len(bucket_idcs) > 0 and len(self.quantile) > 0:
-            X_hist = np.concatenate((X_hist_quantile, X_hist_bucket))
+        if len(bucket_idcs) > 0 and len(self.__quantile) > 0:
+            X_hist = np.concatenate((X_hist__quantile, X_hist_bucket))
             # Place the values of array at specified indices
-            X_hist[self.quantile] = X_hist_quantile
+            X_hist[self.__quantile] = X_hist__quantile
             X_hist[bucket_idcs] = X_hist_bucket
             X_hist = np.transpose(X_hist)
 
@@ -111,15 +114,15 @@ class RandomForest:
             X_hist = np.transpose(X_hist_bucket)
 
         else:
-            X_hist = np.transpose(X_hist_quantile)
+            X_hist = np.transpose(X_hist__quantile)
 
         # Make predictions with every tree in the forest
-        y = np.array([tree.predict(X_hist) for tree in self.decision_trees])
+        y = np.array([tree.predict(X_hist) for tree in self.__decision_trees])
         # Reshape so we can find the most common value
         y = np.swapaxes(y, axis1=0, axis2=1)
 
         if self.prediction_mode == 'classification':
-            if not self.oob:
+            if not self.__oob:
                 # Use majority voting for the final prediction
                 predicted_values = stats.mode(y, axis=1, keepdims=True)[0].reshape(-1)
             else:
@@ -129,7 +132,7 @@ class RandomForest:
                     counter = []
                     for c in classes:
                         indices = np.where(y[i] == c)[0]
-                        counter.append(np.sum([self.decision_trees[j].weight for j in indices]))
+                        counter.append(np.sum([self.__decision_trees[j].weight for j in indices]))
                     predicted_values.append(classes[np.argmax(counter)])
         else:
             predicted_values = np.mean(y, axis=0)
@@ -140,13 +143,14 @@ class RandomForest:
         """
         Iterate over the decision trees in the random forest.
         """
-        for tree in self.decision_trees:
+        for tree in self.__decision_trees:
             yield tree
 
     def get_split_scores(self, X_Hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
-            Tuple[List[List[List[List[float]]]], List[List[List[int]]]]:
+            Tuple[List[Optional[List[List[List[float]]]]], List[Optional[List[List[int]]]]]:
         """
         Calculate the score of a split for each feature and bin. Works on the cur_depth_nodes.
+        Any tree that is finished will return None for scores and counts.
         If they already have an assigned feature and threshold, an error is thrown.
 
         Args:
@@ -165,11 +169,75 @@ class RandomForest:
         """
         scores = []
         counts = []
-        for tree in self.decision_trees:
-            tree_scores, tree_counts = tree.get_split_scores(X_Hist, y, n_bins)
-            scores.append(tree_scores)
-            counts.append(tree_counts)
+        for tree in self.__decision_trees:
+            if tree.finished:
+                scores.append(None)
+                counts.append(None)
+            else:
+                tree_scores, tree_counts = tree.get_split_scores(X_Hist, y, n_bins)
+                scores.append(tree_scores)
+                counts.append(tree_counts)
         return scores, counts
+
+    def set_currently_unset_nodes(self,
+                                  global_best_split: List[Optional[List[Tuple[int, int, float]]]]) \
+                                -> List[Optional[List[int]]]:
+        """
+        Based on the global_split_scores, set the nodes that have not been set yet (current_depth_nodes)
+        Important: This assumes that the indexing of the global_split_scores is the same as the
+        indexing of the trees and nodes in the current_depth_nodes list per tree.
+        Returns the local leaf status of the current_depth_nodes (the nodes set by this function).
+
+        Args:
+            global_split_scores: 3d list of dimensions (n_estimators, num_nodes_cur_level)
+                Contains for each estimator and node a tuple of (feature_idx, bin_idx, score)
+                describing the globally best split. If any entry in the n_estimators dimension is None,
+                the corresponding tree is considered finished and there is no update for this tree.
+
+        Returns:
+            local_leaf_status: 2d list of dimensions (n_estimators, num_leaves_cur_level),
+                Contains per estimator all current_depth_nodes indexes that are leaf nodes.
+        """
+        # TODO: rewrite, should set the current level of the tree and calc the local leaf status
+        # TODO: how de we detect finished trees, this is unclear right now?
+        # probably when setting the global leaf status
+        # I quess then we would just end up with an empty list of current_depth_nodes,
+        # we can then set the tree to be finished
+        local_leaf_status = []
+        for tree_idx, nodes in enumerate(global_best_split):
+            # manage finished/finishing trees
+            if nodes and self.__decision_trees[tree_idx].finished:
+                raise ValueError('Tree is finished but trying to update the trees nodes.')
+            if not nodes or len(nodes) == 0:
+                if not self.__decision_trees[tree_idx].finished:
+                    # should not happen, when setting the global leaf status, the tree
+                    # gets set to finished if needed
+                    raise ValueError('Already finished tree was not set to finnish in the final global leaf update.')
+
+                # we return None as the local leaf status
+                local_leaf_status.append(None)
+                continue
+
+            for node_idx, node in enumerate(nodes):
+                # manage finished/finishing nodes
+                if node and self.__decision_trees[tree_idx].get_cur_depth_nodes()[node_idx].global_leaf:
+                    raise ValueError('Node is finished but trying to update the nodes.')
+
+                # set the node according to the global split information
+                # TODO:
+                # 1. set the feature and threshold
+                # 2. set the score (global score)
+                # 3. set the local leaf status
+                # children are set after finding the global leaf status!
+
+                # detect the local leaf status
+
+    def get_hyperparameters_used(self):
+        """
+        Returns the hyperparameters used in training this model.
+        #TODO: finnish this
+        """
+        raise NotImplementedError('Not yet implemented.')
 
 
 class DecisionTree:
@@ -190,17 +258,17 @@ class DecisionTree:
                  class_weights: Optional[Dict[Any, float]],
                     # weights of the classes (dict[class]=weight)
                  ) -> None:
-        self.max_depth = max_depth
-        self.min_samples_split = min_samples_split
-        self.min_samples_leaf = min_samples_leaf
-        self.feat_idcs = feat_idcs
+        self.__max_depth = max_depth
+        self.__min_samples_split = min_samples_split
+        self.__min_samples_leaf = min_samples_leaf
+        self.__feat_idcs = feat_idcs
         self.finished = False
-        self.leaves = []
-        self.weight = 1
+        self.__weight = 1
+        self.__global_classes = global_classes
+        self.__class_weights = class_weights
+
         self.mode = mode
-        self.global_classes = global_classes
-        self.class_weights = class_weights
-        if self.mode == 'regression' and self.class_weights is not None:
+        if self.mode == 'regression' and self.__class_weights is not None:
             raise ValueError('Weights are not supported for regression.')
 
         # init the root node
@@ -211,7 +279,7 @@ class DecisionTree:
                          class_weights=class_weights,
                          feature_idcs=feat_idcs)
 
-        self.cur_depth_nodes = [self.root]
+        self.__cur_depth_nodes = [self.root]
 
     def predict(self,
                 X):
@@ -225,7 +293,7 @@ class DecisionTree:
         """
         Iterate over the nodes at the current depth.
         """
-        for node in self.cur_depth_nodes:
+        for node in self.__cur_depth_nodes:
             yield node
 
     def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
@@ -250,11 +318,42 @@ class DecisionTree:
         """
         scores = []
         counts = []
-        for node in self.cur_depth_nodes:
+        if len(self.__cur_depth_nodes) == 0:
+            # this method should only be called if there are nodes to calculate the split for
+            raise ValueError('No nodes to calculate the split for.')
+        for node in self.__cur_depth_nodes:
+            # IMPORTANT: we actively don't check if the node is finished, as the nodes in
+            # the current depth are required to not be set yet!
+            # this is why we throw an error if the node is already set
+            # we later should only add the children of non leaf nodes to
+            # current_depth_nodes, this is why if we here then find a set node, we should
+            # throw an error
             node_scores, node_counts = node.get_split_scores(X_hist, y, n_bins)
             scores.append(node_scores)
             counts.append(node_counts)
         return scores, counts
+
+    def get_cur_depth_nodes(self):
+        """
+        Returns all nodes at the current depth.
+        """
+        return self.__cur_depth_nodes
+
+    def _check_leaf_node_consistency(self, node):
+        """
+        Recursive function that finds all nodes without children and checks that they are leaf nodes.
+
+        Raises:
+            ValueError: If a node without children is not a leaf node or a if a leaf node has children.
+        """
+        if node.global_leaf:
+            if node.left or node.right:
+                raise ValueError('Leaf node has children.')
+            return # leaf node with no children, all good
+        if not node.left or not node.right:
+            raise ValueError('Non-leaf node without children.')
+        self._check_leaf_node_consistency(node.left)
+        self._check_leaf_node_consistency(node.right)
 
     def _traverse_tree(self, x, node):
         """
@@ -265,6 +364,7 @@ class DecisionTree:
         if x[node.feature] <= node.threshold:
             return self._traverse_tree(x, node.left)
         return self._traverse_tree(x, node.right)
+
 
 class Node:
     """
@@ -291,8 +391,10 @@ class Node:
                  local_leaf: bool = False, # whether the node is a leaf locally #TODO: how is the local/global leaf determined?
                  value=None #TODO: what is the value?
                  ) -> None:
+        # OPTIMIZATION: we save the feature_idcs in each node, maybe we could save them per tree
+        # and only pass which features we cannot use per node
         self.depth = depth
-        self.sample_idcs = sample_idcs
+        self.__sample_idcs = sample_idcs
         self.feature = feature
         self.threshold = threshold
         self.score = score
@@ -300,13 +402,13 @@ class Node:
         self.left = left
         self.right = right
         self.global_leaf = global_leaf
-        self.local_leaf = local_leaf
-        self.value = value
-        self.global_classes = global_classes
-        self.feature_idcs = feature_idcs
+        self.__local_leaf = local_leaf
+        self.value = value #TODO: what is the value?
+        self.__global_classes = global_classes
+        self.__feature_idcs = feature_idcs
         if len(set(global_classes)) != len(global_classes):
             raise ValueError('Classes must be unique.')
-        self.num_classes = len(global_classes)
+        self._num_classes = len(global_classes)
         if mode not in ['classification', 'regression']:
             raise ValueError('Mode must be either classification or regression.')
         self.mode = mode
@@ -357,12 +459,12 @@ class Node:
             raise ValueError('X_hist and y must have the same number of samples.')
         if len(y.shape) != 1:
             raise ValueError('y must be a 1d array.')
-        node_data = X_hist[self.sample_idcs]
+        node_data = X_hist[self.__sample_idcs]
         scores = []
             # num_features x num_bins
         counts = []
             # list of length num_features, containing the counts of samples for each feature
-        for feature_idx in self.feature_idcs:
+        for feature_idx in self.__feature_idcs:
             feature_data = node_data[:, feature_idx]
             scores_per_bin = []
                 # array of length num_bins containing the scores per_bin
@@ -431,14 +533,14 @@ class Node:
         total_right = np.sum(right_weights)
         total_y = total_left + total_right
 
-        gini_left = 1.0 - np.sum((np.bincount(left_y.astype('int'), minlength=self.num_classes, weights=left_weights) / total_left) ** 2)
+        gini_left = 1.0 - np.sum((np.bincount(left_y.astype('int'), minlength=self._num_classes, weights=left_weights) / total_left) ** 2)
             # with np.bincount we get an array of length n_classes with the index being the specific
             # class. The values are the added weights of the samples of each class.
             # if self.class_weights is None, we just add one for each sample, so we have the
             # counts of samples of each class
             # we then divide by the total weight/total number of samples
             # to get the probability of each class
-        gini_right = 1.0 - np.sum((np.bincount(right_y.astype('int'), minlength=self.num_classes, weights=right_weights) / total_right) ** 2)
+        gini_right = 1.0 - np.sum((np.bincount(right_y.astype('int'), minlength=self._num_classes, weights=right_weights) / total_right) ** 2)
         gini = (total_left / total_y) * gini_left + (total_right / total_y) * gini_right
             # we add the two gini impurities weighted by the number of samples/weights by total weight
         return gini

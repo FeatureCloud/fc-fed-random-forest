@@ -93,24 +93,27 @@ class InitialState(AppState):
         client.init_forest()
 
         # Build the trees iteratively
+        # two step loop:
+        # calculate global split scores
+        # set global leaf nodes and set current depth nodes to the next uncalculated nodes
         counter = 0
         while True:
             counter += 1
-            # we stop via the stopping criteria
-            #TODO: stopping criteria management here
 
-            ### We build the current depth of the trees
             # local scores
             local_scores, local_counts = client.get_current_level_splitscores()
-                #TODO: how to manage leaf nodes? Before we did this:
-                # if leaf:
-                # local_split_score = [[0] * n_bins for _ in range(len(decision_tree.feat_idcs))]
+                # this iterates over all trees but only iterates over the current depth nodes per tree
+                # which are only not yet finished nodes. The global split scores
+                # contain a None value for trees that are already finished.
+                # this is because at the end of this loop, all current depth nodes are changed for
+                # their leaf status and then the currrent depth nodes are all child nodes which
+                # at this state still need to be processed
+                # TODO: ensure the global_split_data really contains None for finished trees
             self.send_data_to_coordinator([local_scores, local_counts], memo=f"local_scores_{counter}")
                 # clients x splits x trees x nodes_current_depth x feature x n_bins
 
-
+            # local scores -> global scores
             if self.is_coordinator:
-                # local_scores -> global_scores
                 result = self.gather_data(memo=f"local_scores_{counter}")
                 global_split_scores = client.coord_aggregate_split_scores(client_split_scores=\
                                                         [result[i][0] for i in range(len(result))],
@@ -118,16 +121,47 @@ class InitialState(AppState):
                                                         [result[i][1] for i in range(len(result))])
                 self.broadcast_data(global_split_scores, send_to_self=True)
 
+            global_split_scores = self.await_data()
+            # set nodes and find local leaves
+            # TODO
+
+            if self.is_coordinator:
+                # local leaves -> global leaves
+                # TODO
+                raise NotImplementedError("TODO: implement the global leaf calculation")
+
+            # find global leaves and set the new current depth nodes
+            # TODO
+
+            # check if we are done too escape the loop
+            # TODO
+
+
             # TODO: continue here
+            # TODO: all attributes in the model that are only used during construction should
+            # 1. be set with the _ prefix
+            # 2. be set to None after they are not needed anymore (sample_idcs, feature_idcs, ...)
             # equivalent in the old code is in aggregate_splits after the self.broadcast_data(global_splits, send_to_self=False)
             # careful, here is where node.samples MUST be set correctly!!!
             # It should be set for the current depth nodes, then after the stopping criteria stuff
             # we should set the next depth nodes and their samples correctly
+            # TODO: we should really be sure the indexing is done correctly here
+            # maybe we have a string indexing for nodes and their children?
+            # e.g. level 2 nodes index is:
+            # comnplete_index = level_0_parent_idx$level_1_parent_idx$own_index
+            # own_index = own_index
+            # alternatively:
+            # Per tree we have the cur_level_nodes and the next_level_nodes
+            # we itereate the cur_level_nodes, calc split_scores, aggregate them, set the next_level_nodes
+            # find the leaves of the cur_level_nodes, set them, then set cur_level_nodes to next_level_nodes
+            # and clear next_level_nodes
 
 
 
 
         #TODO:
+        # after adding the  stopping criteria stuff, when calculating split scores and when aggregating them
+        # we need to mark leaf nodes/finnished trees correctly and set the samples correctly
         # Missing bugs to fix:
         # The splitscore should be calculated correctly using the correct sampleset, not always
         # the full decision trees sampleset

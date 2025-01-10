@@ -583,6 +583,38 @@ class FedHistRandomForestClient():
             counts.append(count)
         return scores, counts
 
+    def set_current_depth_nodes(self,
+                                global_best_split: List[List[Optional[List[Tuple[int, int, float]]]]]) \
+                                -> List[List[Optional[List[int]]]]:
+        """
+        Based on the globally calculated best splits, sets the current nodes of the trees.
+        Sets their threshold, score and feature index.
+        Also checks if the node is locally a leaf node.
+        Returns the leaf information.
+        The leaf information needs to be aggregated by the coordinator to finally set the
+        current depth nodes.
+
+        Returns:
+            leaf_info: List[List[List[int]]] (splits x n_estimators x num_leaf_nodes):
+                The leaf information of the nodes. Per split, per tree, contains the indexes in
+                current_depth_nodes that are leaf nodes. If the tree is finished, None is returned
+                for this tree.
+        """
+        if not self.rf_models:
+            raise ValueError('The forest has not been initialized yet')
+        if not self.X_hist or not self.split_points:
+            raise ValueError('Binning information must be set before setting nodes')
+        if not self.global_classes:
+            raise ValueError('Global classes must be set before setting nodes')
+        if not self.global_means or not self.global_stddevs or not self.global_counts:
+            raise ValueError('Global statistics must be set before setting nodes')
+        local_leaves = []
+        for split_idx, rf_model in enumerate(self.rf_models):
+            estimator_leaf_nodes = rf_model.set_currently_unset_nodes(global_best_split[split_idx])
+            local_leaves.append(estimator_leaf_nodes)
+        return local_leaves
+
+
     def coord_ensure_config_alignment(self,
                                       feature_names: List[List[str]],
                                       quantile_idcs: List[List[int]],
@@ -839,9 +871,9 @@ class FedHistRandomForestClient():
         return RF_feat_idcs
 
     def coord_aggregate_split_scores(self,
-                                     client_split_scores: List[List[List[List[List[float]]]]],
-                                     sample_count_per_client: List[List[List[List[List[int]]]]]) \
-            -> List[List[List[Tuple[int, int, float]]]]:
+                                     client_split_scores: List[List[List[Optional[List[List[float]]]]]],
+                                     sample_count_per_client: List[List[List[Optional[List[List[int]]]]]]) \
+            -> List[List[Optional[List[Tuple[int, int, float]]]]]:
         """
         Aggregates the split scores from all clients to a global split score.
         The split score per client was calculated by self.get_current_level_splitscores.
@@ -865,28 +897,45 @@ class FedHistRandomForestClient():
 
         global_split_scores = []
             # split x n_estimators x n_nodes x (feature_idx, bin_idx, score)
-        total_samples = np.sum(sample_count_per_client, axis=0)
-            # collapse sample axis, new dimensions are:
-            # splits x n_estimators x n_nodes x n_features
         for split_idx, _ in enumerate(self.X_hist):
             tree_scores = []
             for tree_idx, tree in enumerate(self.rf_models[split_idx].iterate_trees()):
                 node_scores = []
-                for node_idx, node in enumerate(tree.iterate_cur_depth_nodes()):
-                    # extract the relevant split scores
-                    split_scores = [d[split_idx][tree_idx][node_idx] for d in client_split_scores]
+                if tree.finished:
+                    # ensure that no client sent any data for this tree
+                    if any([specific_client_split_score[split_idx][tree_idx] is not None \
+                            for specific_client_split_score in client_split_scores]):
+                        raise ValueError(f'Tree {tree_idx} is already finished but clients sent data')
+                    tree_scores.append(None)
+                    continue
+                # ensure that all clients sent data for this tree
+                # pylance doesn't understand taht we do this so later we use type: ignore
+                if not all([specific_client_split_score[split_idx][tree_idx] is not None \
+                            for specific_client_split_score in client_split_scores]):
+                    raise ValueError(f'Not all clients sent data for the tree {tree_idx}')
+
+                for node_idx, _ in enumerate(tree.iterate_cur_depth_nodes()):
+                    split_scores = [d[split_idx][tree_idx][node_idx] for d in client_split_scores] #type: ignore
                         # clients x features x n_bins
-                    sample_counts = [c[split_idx][tree_idx][node_idx] for c  in sample_count_per_client]
+                    sample_counts = [c[split_idx][tree_idx][node_idx] for c  in sample_count_per_client] #type: ignore
                         # clients x features
                     total_counts = np.sum(sample_counts, axis=0)
-                    ratios = np.divide(sample_counts, total_samples)
+                        # vector of length features of the total number of samples over all clients
+                        # per feature of this specific node
+                    ratios = np.divide(sample_counts, total_counts)
                         # this is the weight to use for the relevant client
+                        # dividing clients x features by features -> ratio for each client and feature
+                        # (clients x features dimensions)
                     # sum up the split scores considering the weights
-                    sum_split_score = np.sum([split_scores[i] * ratios[i] for i in range(len(split_scores))], axis=0)
-                        # features x n_bins
-                    if len(sum_split_score) != 2:
-                        raise ValueError('Split score must have length 2')
+                    sum_split_score = np.sum([split_scores[client_idx] * ratios[client_idx] for client_idx in range(len(split_scores))], axis=0)
+                        # we multiply the split scores with the ratios of the relevant client
+                        # then we can sum over the clients axis
+                        # this results in the end in a features x n_bins matrix
+                    assert sum_split_score.shape == (self.n_features, self.n_bins)
                     feature_idx, bin_idx = np.unravel_index(np.argmin(sum_split_score), sum_split_score.shape)
+                        # we find the feature and bin index with the lowest score over all features and bins
+                        # np.argmin returns the index of the flattened array, we need to unravel it
+                        # back to the original (sum_split_score.shape) shape
                     min_score = np.min(sum_split_score)
                     node_scores.append((feature_idx, bin_idx, min_score))
                 tree_scores.append(node_scores)
