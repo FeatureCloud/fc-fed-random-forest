@@ -12,34 +12,71 @@ class RandomForest:
     def __init__(self,
                  n_estimators: int,
                  max_samples: float,
-                 feat_idcs: np.ndarray, # List of feature indices for each tree,
-                                        # n_estimators x n_features
+                 feat_idcs: np.ndarray,
                  max_depth: int,
                  min_samples_split: int,
-                 min_samples_leaf: int,
-                 n_patients_local: int, # Number of patients in the local dataset
-                 n_patients_global: int, # Number of patients in the global, aggregated dataset
                  bootstrap: bool,
                  random_state: int,
-                 quantile: np.ndarray, # List of feature indices using quantile binning
-                 global_mean: np.ndarray, # Global mean for each feature
-                 global_stddev: np.ndarray, # global standard deviation for each feature
-                 split_points: np.ndarray, #  n_features x n_bins - 1,  #TODO: fix them
-                 prediction_mode: str, # 'classification' or 'regression'
-                 global_classes: np.ndarray, # global classes. Should be the same in the
-                                        # same order for all clients
+                 quantile: np.ndarray,
+                 global_mean: np.ndarray,
+                 global_stddev: np.ndarray,
+                 split_points: np.ndarray,
+                 prediction_mode: str,
+                 global_classes: np.ndarray,
                  oob: bool,
                  class_weights: Optional[Dict[Any, float]],
-                    # weights of the classes (dict[class]=weight)
+                 X_hist: np.ndarray,
+                 y: np.ndarray,
+                 num_bins: int,
+                 min_impurity_decrease: float = 0.0
                 ) -> None:
+        """
+        The random forest model for federated learning. Sets the following parameters at initialization
+
+        Args:
+            n_estimators: number of trees in the forest
+            max_samples: the maximum fraction of samples to use for each tree
+            feat_idcs: List of feature indices for each tree, n_estimators x n_features
+            max_depth: the maximum depth of the trees, e.g. 5 means at most 5 splits
+            min_samples_split: the minimum number of samples required to split an internal node
+            min_samples_leaf: the minimum number of samples required to be at a leaf node
+            n_patients_local: number of patients in the local dataset
+            n_patients_global: number of patients in the global, aggregated dataset
+            bootstrap: whether to use bootstrap samples
+            random_state: the random seed to use
+            quantile: List of feature indices using quantile binning
+            global_mean: global mean for each feature (n_estimators x n_features)
+            global_stddev: global standard deviation for each feature (n_estimators x n_features)
+            split_points: The threshold values for each feature.
+                Dimensions are n_features x n_bins - 1 as the values min and max are excluded:
+                    ]min, val1, ..., max[
+                    A bin_idx of 0 would mean a threshold of <= split_points[0] -> left child,
+                    A bin_idx of len(split_points-1) would mean a threshold of <= split_points[-1] -> left child
+                    #TODO: double check the indexing here, this is key
+            prediction_mode: 'classification' or 'regression'
+            global_classes: global classes. Should be the same in the same order for all clients
+            oob: whether to use out-of-bag # TODO: finnish this description, should be used in the evaluation?
+            class_weights: weights of the classes (dict[class]=weight)
+                Set to None if no class weights are used and when the training finishes
+            X_hist: input data, 2d array of shape (n_samples, n_features).
+                The values are NOT the actual values but the bin indices the samples belong to
+                This is used in the training process to calculate the split scores
+                When the training is done, the data is removed
+                #TODO: ensure it is removed!!!
+                #TODO: use this
+            y: target data, 1d array of shape (n_samples), indicating the target value
+                This is used in the training process to calculate the split scores
+                When the training is done, the data is removed
+            n_bins: number of bins to consider for each feature.
+            min_impurity_decrease: if a nodes impurity in comparison to the parent is smaller than this
+                value, the node is not split further and becomes a leaf node
+                Default is 0 aka it just needs to be better than the parent
+        """
         # private vars
         self.__max_samples = max_samples
         self.__feat_idcs = feat_idcs
         self.__max_depth = max_depth
         self.__min_samples_split = min_samples_split
-        self.__min_samples_leaf = min_samples_leaf
-        self.__n_patients_local = n_patients_local
-        self.__n_patients_global = n_patients_global
         self.__bootstrap = bootstrap
         self.__random_state = random_state
         self.__decision_trees: List[DecisionTree] = []
@@ -51,6 +88,12 @@ class RandomForest:
         self.__global_classes = global_classes
         self.__class_weights = class_weights
         self.__oob = oob
+        self.__X_hist = X_hist
+        self.__y = y
+        self.__num_bins = num_bins
+        if num_bins-1 != split_points.shape[1]:
+            raise ValueError('Number of bins must match number of split points.')
+        self.min_impurity_decrease = min_impurity_decrease
         self.finished = False
 
         # public vars
@@ -58,24 +101,24 @@ class RandomForest:
         self.n_estimators = n_estimators
 
         # init the trees
-        for _ in range(self.n_estimators):
-            sample_idcs = self.__bootstrap_samples()
+        for tree_idx in range(self.n_estimators):
+            sample_idcs = self.__bootstrap_samples(n_patients_local=len(y))
             tree = DecisionTree(samples_idcs=sample_idcs,
                                 max_depth=self.__max_depth,
                                 min_samples_split=self.__min_samples_split,
-                                min_samples_leaf=self.__min_samples_leaf,
-                                feat_idcs=self.__feat_idcs,
+                                feat_idcs=self.__feat_idcs[tree_idx],
                                 mode=self.prediction_mode,
                                 global_classes=self.__global_classes,
                                 class_weights=self.__class_weights)
             self.__decision_trees.append(tree)
 
-    def __bootstrap_samples(self):
-        sample_size = max(round(self.__n_patients_local * self.__max_samples), 1)
-        sample_idcs = np.random.choice(self.__n_patients_local, sample_size, replace=self.__bootstrap)
+    def __bootstrap_samples(self, n_patients_local: int) -> np.ndarray:
+        sample_size = max(round(n_patients_local * self.__max_samples), 1)
+        sample_idcs = np.random.choice(n_patients_local, sample_size, replace=self.__bootstrap)
         return sample_idcs
 
     def predict(self, X):
+        raise NotImplementedError('Not yet implemented.')
         #TODO: double check this, this funcction was not verified!!!
         bucket_idcs = np.setdiff1d(np.arange(len(X[0])), self.__quantile)
 
@@ -146,8 +189,10 @@ class RandomForest:
         for tree in self.__decision_trees:
             yield tree
 
-    def get_split_scores(self, X_Hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
-            Tuple[List[Optional[List[List[List[float]]]]], List[Optional[List[List[int]]]]]:
+    def get_split_scores(self) -> \
+            Tuple[List[Optional[List[List[List[float]]]]],
+                  List[Optional[List[List[int]]]],
+                  List[Optional[List[Optional[Any]]]]]:
         """
         Calculate the score of a split for each feature and bin. Works on the cur_depth_nodes.
         Any tree that is finished will return None for scores and counts.
@@ -166,71 +211,103 @@ class RandomForest:
             len(self.feat_idcs), n_bins), containing the score of a split per feature and bin.
             counts: 3d array of shape (n_estimators, num_nodes_cur_level, len(self.feat_idcs)),
                 containing the counts of samples for each feature and node per tree
+            only_class: 2d array of shape (n_estimators, num_nodes_cur_level), containing the
+                class if the node has only one class, None otherwise
+                The whole array of nodes might be None if the tree is finished.
         """
         scores = []
         counts = []
+        only_class = []
+        if not self.__X_hist or not self.__y:
+            raise ValueError('No data to calculate the split scores. Is the model finished?')
         for tree in self.__decision_trees:
             if tree.finished:
                 scores.append(None)
                 counts.append(None)
+                only_class.append(None)
             else:
-                tree_scores, tree_counts = tree.get_split_scores(X_Hist, y, n_bins)
+                tree_scores, tree_counts, tree_only_class = tree.get_split_scores(
+                    X_hist=self.__X_hist,
+                    y=self.__y,
+                    n_bins=self.__num_bins)
                 scores.append(tree_scores)
                 counts.append(tree_counts)
-        return scores, counts
+                only_class.append(tree_only_class)
+        return scores, counts, tree_only_class
 
     def set_currently_unset_nodes(self,
-                                  global_best_split: List[Optional[List[Tuple[int, int, float]]]]) \
-                                -> List[Optional[List[int]]]:
+                                  global_best_split: List[Optional[List[Tuple[int, int, float]]]],
+                                  global_leaf_info: List[Optional[List[int]]]) \
+                                -> None:
         """
         Based on the global_split_scores, set the nodes that have not been set yet (current_depth_nodes)
         Important: This assumes that the indexing of the global_split_scores is the same as the
         indexing of the trees and nodes in the current_depth_nodes list per tree.
-        Returns the local leaf status of the current_depth_nodes (the nodes set by this function).
+        Then sets the next current_depth_nodes based on the leaf info. If that list is empty,
+        the tree is set to be finished.
 
         Args:
-            global_split_scores: 3d list of dimensions (n_estimators, num_nodes_cur_level)
+            global_split_scores: 2d list of dimensions (n_estimators, num_nodes_cur_level)
                 Contains for each estimator and node a tuple of (feature_idx, bin_idx, score)
                 describing the globally best split. If any entry in the n_estimators dimension is None,
                 the corresponding tree is considered finished and there is no update for this tree.
-
-        Returns:
-            local_leaf_status: 2d list of dimensions (n_estimators, num_leaves_cur_level),
-                Contains per estimator all current_depth_nodes indexes that are leaf nodes.
+            global_leaf_info: 2d list of dimensions (n_estimators, num_leaf_nodes),
+                Contains for each estimator the indexes of the leaf nodes.
         """
-        # TODO: rewrite, should set the current level of the tree and calc the local leaf status
-        # TODO: how de we detect finished trees, this is unclear right now?
-        # probably when setting the global leaf status
-        # I quess then we would just end up with an empty list of current_depth_nodes,
-        # we can then set the tree to be finished
-        local_leaf_status = []
-        for tree_idx, nodes in enumerate(global_best_split):
-            # manage finished/finishing trees
-            if nodes and self.__decision_trees[tree_idx].finished:
-                raise ValueError('Tree is finished but trying to update the trees nodes.')
-            if not nodes or len(nodes) == 0:
-                if not self.__decision_trees[tree_idx].finished:
-                    # should not happen, when setting the global leaf status, the tree
-                    # gets set to finished if needed
-                    raise ValueError('Already finished tree was not set to finnish in the final global leaf update.')
-
-                # we return None as the local leaf status
-                local_leaf_status.append(None)
+        if not self.__X_hist or not self.__y or not self.__split_points:
+            raise ValueError('No data to set the nodes. Is the model finished?')
+        for tree_idx, tree in enumerate(self.__decision_trees):
+            if global_best_split[tree_idx] is None or global_leaf_info[tree_idx] is None:
+                if not tree.finished:
+                    raise ValueError('Global model assumes finished tree, local model does not.')
                 continue
 
-            for node_idx, node in enumerate(nodes):
-                # manage finished/finishing nodes
-                if node and self.__decision_trees[tree_idx].get_cur_depth_nodes()[node_idx].global_leaf:
-                    raise ValueError('Node is finished but trying to update the nodes.')
+            relevant_leaf_idxs = set([global_leaf_info[tree_idx]])
+            next_depth_nodes = []
+            for node_idx, node in enumerate(tree.iterate_cur_depth_nodes()):
+                if node.is_leaf_node():
+                    raise ValueError('Leaf nodes should not be in the current depth nodes when setting this nodes.')
+                # set node to leaf if necessary
+                if node_idx in relevant_leaf_idxs:
+                    node.set_leaf_node()
+                    # done with this node
+                    continue
+                # update the node and create the children correctly
+                if node_idx >= len(global_best_split[tree_idx]): #type: ignore
+                    raise ValueError('Global model assumes more nodes than local model.')
+                feature_idx, bin_idx, score = global_best_split[tree_idx][node_idx] #type: ignore
+                left_child, right_child = node.set_node(
+                    feature_idx=feature_idx,
+                    bin_idx=bin_idx,
+                    threshold=self.__split_points[feature_idx, bin_idx],
+                    score=score,
+                    X_hist=self.__X_hist
+                )
+                # add the children to the next depth nodes list
+                next_depth_nodes.append(left_child)
+                next_depth_nodes.append(right_child)
+            # update the current depth nodes to the next depth nodes
+            tree.update_cur_depth_nodes(next_depth_nodes)
 
-                # set the node according to the global split information
-                # TODO:
-                # 1. set the feature and threshold
-                # 2. set the score (global score)
-                # 3. set the local leaf status
-                # children are set after finding the global leaf status!
-
-                # detect the local leaf status
+    def check_finished(self):
+        """
+        Check if all trees are finished.
+        Performs cleanup and sets the finished flag if all trees are finished.
+        Returns:
+            True if all trees are finished, False otherwise.
+        """
+        for tree in self.__decision_trees:
+            if not tree.finished:
+                return False
+        # cleanup
+        self.__X_hist = None
+        self.__y = None
+        self.__class_weights = None
+        self.__split_points = None
+        self.__global_mean = None
+        self.__global_stddev = None
+        self.finished = True
+        return True
 
     def get_hyperparameters_used(self):
         """
@@ -249,9 +326,8 @@ class DecisionTree:
                  samples_idcs: np.ndarray, # 1d array of indices of the samples to be used
                  max_depth: int,
                  min_samples_split: int,
-                 min_samples_leaf: int,
-                 feat_idcs: np.ndarray, # List of feature indices for each tree,
-                                        # n_estimators x n_features
+                 feat_idcs: np.ndarray, # List of feature indices for this tree:
+                                        # 1d array of length n_features
                  mode: str, # classification or regression
                  global_classes: np.ndarray, # global classes. Should be the same in the
                                         # same order for all clients
@@ -260,7 +336,6 @@ class DecisionTree:
                  ) -> None:
         self.__max_depth = max_depth
         self.__min_samples_split = min_samples_split
-        self.__min_samples_leaf = min_samples_leaf
         self.__feat_idcs = feat_idcs
         self.finished = False
         self.__weight = 1
@@ -277,7 +352,8 @@ class DecisionTree:
                          mode=mode,
                          global_classes=global_classes,
                          class_weights=class_weights,
-                         feature_idcs=feat_idcs)
+                         feature_idcs=feat_idcs,
+                         parent=None)
 
         self.__cur_depth_nodes = [self.root]
 
@@ -297,7 +373,7 @@ class DecisionTree:
             yield node
 
     def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
-            Tuple[List[List[List[float]]], List[List[int]]]:
+            Tuple[List[List[List[float]]], List[List[int]], List[Optional[Any]]]:
         """
         Calculate the score of a split for each feature and bin. Works on the cur_depth_nodes.
         If they already have an assigned feature and threshold, an error is thrown.
@@ -315,12 +391,15 @@ class DecisionTree:
             containing the score of a split per feature and bin.
             counts: 2d list of dimensions (num_nodes_cur_level, len(self.feat_idcs)), containing
                 the counts of samples for each feature and node
+            only_class: 1d list of length num_nodes_cur_level, containing the class if the node
+                has only one class, None otherwise
         """
         scores = []
         counts = []
-        if len(self.__cur_depth_nodes) == 0:
+        only_classes = []
+        if len(self.__cur_depth_nodes) == 0 or self.finished:
             # this method should only be called if there are nodes to calculate the split for
-            raise ValueError('No nodes to calculate the split for.')
+            raise ValueError('No nodes to calculate the split for, the tree is finished.')
         for node in self.__cur_depth_nodes:
             # IMPORTANT: we actively don't check if the node is finished, as the nodes in
             # the current depth are required to not be set yet!
@@ -328,16 +407,35 @@ class DecisionTree:
             # we later should only add the children of non leaf nodes to
             # current_depth_nodes, this is why if we here then find a set node, we should
             # throw an error
-            node_scores, node_counts = node.get_split_scores(X_hist, y, n_bins)
+            node_scores, node_counts, only_class = node.get_split_scores(X_hist, y, n_bins)
             scores.append(node_scores)
             counts.append(node_counts)
-        return scores, counts
+            only_classes.append(only_class)
+        return scores, counts, only_classes
 
     def get_cur_depth_nodes(self):
         """
         Returns all nodes at the current depth.
         """
         return self.__cur_depth_nodes
+
+    def get_cur_depth_node(self, idx):
+        """
+        Returns the node at the current depth with the given index.
+        """
+        return self.__cur_depth_nodes[idx]
+
+    def update_cur_depth_nodes(self, new_nodes):
+        """
+        Updates the current depth nodes to the new nodes.
+        If this results in an empty list, the tree is considered finished.
+        """
+        self.__cur_depth_nodes = new_nodes
+        if len(self.__cur_depth_nodes) == 0:
+            self.__feat_idcs = None
+            self.__class_weights = None
+            self.finished = True
+
 
     def _check_leaf_node_consistency(self, node):
         """
@@ -376,36 +474,43 @@ class Node:
                  mode: str, # classification or regression
                  global_classes: np.ndarray, # global classes. Should be the same in the
                                              # same order for all clients
-                 feature_idcs: np.ndarray, # List of feature indices for each tree,
+                 feature_idcs: np.ndarray, # List of feature indices of this nodes tree::
+                                           # 1d array of length n_features
                  class_weights: Optional[Dict[Any, float]],
                     # weights of the classes: (dict[class]=weight)
-                 feature: Optional[int] = None, # the feature index used in this node
-                 threshold: Optional[Union[float, int]] = None,
-                    # the threshold whether to go left or right. The decision is x <= threshold
-                    #TODO: right? Wait maybe we need the info if we're right or left
-                 score: Optional[float] = None, # the score (e.g. gini impurity) of the split
-                 parent: Optional["Node"] = None, # pointer to the parent node
-                 left: Optional["Node"] = None, # pointer to the left child
-                 right: Optional["Node"] = None, # pointer to the right child
-                 global_leaf: bool = False, # whether the node is a leaf globally
-                 local_leaf: bool = False, # whether the node is a leaf locally #TODO: how is the local/global leaf determined?
-                 value=None #TODO: what is the value?
+                 parent: Optional["Node"], # pointer to the parent node
                  ) -> None:
+        """
+        The node of a decision tree.
+        Some parameters are not set at initialization.
+
+        Args:
+            depth: the depth of the node in the tree
+            sample_idcs: 1d array of indices of the samples this node uses
+                These are the samples that passed through the parent node in the decision tree
+            mode: classification or regression
+            global_classes: global classes. Should be the same in the same order for all clients
+            feature_idcs: List of feature indices of this nodes tree
+                1d array of length n_features
+            class_weights: weights of the classes: (dict[class]=weight)
+            parent: pointer to the parent node
+        """
         # OPTIMIZATION: we save the feature_idcs in each node, maybe we could save them per tree
         # and only pass which features we cannot use per node
         self.depth = depth
-        self.__sample_idcs = sample_idcs
-        self.feature = feature
-        self.threshold = threshold
-        self.score = score
         self.parent = parent
-        self.left = left
-        self.right = right
-        self.global_leaf = global_leaf
-        self.__local_leaf = local_leaf
-        self.value = value #TODO: what is the value?
+        self.__sample_idcs = sample_idcs
         self.__global_classes = global_classes
         self.__feature_idcs = feature_idcs
+
+        self.feature_idx = None
+        self.bin_idx = None
+        self.threshold = None
+        self.score = None
+        self.left = None
+        self.right = None
+        self.global_leaf = None
+
         if len(set(global_classes)) != len(global_classes):
             raise ValueError('Classes must be unique.')
         self._num_classes = len(global_classes)
@@ -417,6 +522,89 @@ class Node:
                 raise ValueError('Class weights must be given for all classes or not at all')
         self.class_weights = class_weights
 
+    def set_node(self,
+                 feature_idx: int,
+                 bin_idx: int,
+                 threshold: Union[float, int],
+                 score: float,
+                 X_hist: np.ndarray) -> Tuple["Node", "Node"]:
+        """
+        Set the feature, threshold and score of the node.
+        Then creates the left and right child nodes and returns them.
+
+        Args:
+            feature_idx: the feature index to use in this node
+            bin_idx: the bin index to use in this node
+            threshold: the threshold value at which to split the data
+                threshold is used with the actual data, bin_idx with the histogram data
+                threshold is the value where to split, splitting is
+                x <= threshold -> left child, x > threshold -> right child
+            score: the score (e.g. gini impurity) of the split
+            X_hist: input data, 2d array of shape (n_samples, n_features).
+                The values are NOT the actual values but the bin indices the samples belong to
+                for each feature. This is used to calculate the sampleset for the children together
+                with the bin_idx. The threshold is not used here.
+
+        Returns:
+            A tuple left_child_node, right_child_node
+            Contains the left and right child nodes of the current node.
+        """
+        if self.feature_idx or self.bin_idx or self.threshold or self.score:
+            raise ValueError('Trying to set a node that is set already.')
+        if self.global_leaf:
+            raise ValueError('Trying to set a leaf node.')
+
+        # set the node
+        self.feature_idx = feature_idx
+        self.bin_idx = bin_idx
+        self.threshold = threshold
+        self.score = score
+
+        relevant_data = X_hist[self.__sample_idcs, feature_idx]
+        # create the left and right child nodes
+        left_child_idcs, right_child_idcs = self.perform_hist_based_split(relevant_data, bin_idx)
+        child_feature_idcs = np.delete(self.__feature_idcs, feature_idx)
+        left_child = Node(depth=self.depth + 1,
+                            sample_idcs=left_child_idcs,
+                            mode=self.mode,
+                            global_classes=self.__global_classes,
+                            class_weights=self.class_weights,
+                            feature_idcs=child_feature_idcs,
+                            parent=self)
+        right_child = Node(depth=self.depth + 1,
+                            sample_idcs=right_child_idcs,
+                            mode=self.mode,
+                            global_classes=self.__global_classes,
+                            class_weights=self.class_weights,
+                            feature_idcs=child_feature_idcs,
+                            parent=self)
+        self.left = left_child
+        self.right = right_child
+
+        # remove somewhat private variables
+        self._cleanup_node()
+        return left_child, right_child
+
+    def set_leaf_node(self) -> None:
+        """
+        Set the node as a leaf node.
+        """
+        self.global_leaf = True
+        self._cleanup_node()
+        if self.left or self.right:
+            raise ValueError('Leaf node has children.')
+        if self.feature_idx or self.bin_idx or self.threshold or self.score:
+            raise ValueError('Leaf node should not have a split.')
+
+    def _cleanup_node(self):
+        """
+        When a node is finished (either set as a leaf or as a split node), we remove the
+        variables that are not needed anymore and potentially private.
+        """
+        self.__sample_idcs = None
+        self.feature_idcs = None
+        self.class_weights = None
+
     def is_leaf_node(self):
         """
         Whether the node is GLOBALLY considered a leaf node.
@@ -424,7 +612,7 @@ class Node:
         return self.global_leaf
 
     def get_split_scores(self, X_hist: np.ndarray, y: np.ndarray, n_bins: int) -> \
-            Tuple[List[List[float]], List[int]]:
+            Tuple[List[List[float]], List[int], Optional[Any]]:
         """
         Calculate the score of a split for each feature and bin.
         Throws an error if the node alreadt has a set feature and threshold.
@@ -441,6 +629,7 @@ class Node:
             scores: 2d array of shape (len(self.feature_idcs), n_bins), containing the score of a split per
                 feature and bin.
             counts: list of length len(self.feature_idcs), containing the counts of samples for each feature
+            only_class: the class if the node sampleset has only one class, None otherwise
         """
         # TODO: possible optimization:
         # the splitscore calculation is wrong right now.
@@ -450,7 +639,7 @@ class Node:
         # and #samples_right per client with the coordinator to aggregate it, then broadcast it
         # back to the clients and use it to calculate the gini impurity. If weighting is used,
         # we could instead exchange the corresponding weightsums.
-        if self.feature is not None or self.threshold is not None:
+        if self.feature_idx is not None or self.threshold is not None:
             raise ValueError('Node already has a split.')
         # ensure input data formatting
         if len(X_hist.shape) != 2:
@@ -469,12 +658,7 @@ class Node:
             scores_per_bin = []
                 # array of length num_bins containing the scores per_bin
             for bin_idx in range(n_bins):
-                # we split the data into <= threshold and > threshold
-                left_idxs = np.where(feature_data <= bin_idx)[0]
-                    # feature_data <= bin_idx returns a boolean array
-                    # np.where then returns the indices of the True values
-                    # we need to add [0] as np.where always returns a tuple
-                right_idxs = np.where(feature_data > bin_idx)[0]
+                left_idxs, right_idxs = self.perform_hist_based_split(feature_data, bin_idx)
                 left_y = y[left_idxs]
                 right_y = y[right_idxs]
                 if self.mode == 'classification':
@@ -485,7 +669,39 @@ class Node:
                 scores_per_bin.append(score)
             scores.append(scores_per_bin)
             counts.append(len(feature_data))
-        return scores, counts
+
+        # potential stopping criteria:
+        # node only contains one class
+        # this is independant of the split_feature and bin, these influence the child nodes
+        # only_class status and are considered when this function is called on the child nodes
+        only_class = None
+        if len(np.unique(y)) == 1:
+            # if other clients have different classes, this is not a leaf!
+            # just send this information along and decide on the coordinator
+            only_class = y[0]
+        return scores, counts, only_class
+
+    def perform_hist_based_split(self, X_hist_col: np.ndarray, bin_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Based on specific samples of a specific feature in the X_hist data as well as the bin_idx
+        where to split, return the indices of the samples that would end up in the left and right
+        child node.
+        Uses the following formula:
+            left_idxs = np.where(X_hist_col <= bin_idx)[0]
+            right_idxs = np.where(X_hist_col > bin_idx)[0]
+        Therefore left_idxs includes the samples right at the threshold
+
+        Args:
+            X_hist_col: the column of the X_hist data that we are considering. A 1d array.
+            bin_idx: the bin index where to split
+
+        Returns:
+            Tuple[left_idxs, right_idxs]: the indices of the samples that would end up in the left
+                and right child node.
+        """
+        left_idxs = np.where(X_hist_col <= bin_idx)[0]
+        right_idxs = np.where(X_hist_col > bin_idx)[0]
+        return left_idxs, right_idxs
 
     def _gini_split_score(self, left_y: np.ndarray, right_y: np.ndarray) \
             -> np.floating:

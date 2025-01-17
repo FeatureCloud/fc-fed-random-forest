@@ -101,43 +101,32 @@ class InitialState(AppState):
             counter += 1
 
             # local scores
-            local_scores, local_counts = client.get_current_level_splitscores()
-                # this iterates over all trees but only iterates over the current depth nodes per tree
-                # which are only not yet finished nodes. The global split scores
-                # contain a None value for trees that are already finished.
-                # this is because at the end of this loop, all current depth nodes are changed for
-                # their leaf status and then the currrent depth nodes are all child nodes which
-                # at this state still need to be processed
+            local_scores, local_counts, only_class = client.get_current_level_splitscores()
+                # TODO: explain this a bit
                 # TODO: ensure the global_split_data really contains None for finished trees
-            self.send_data_to_coordinator([local_scores, local_counts], memo=f"local_scores_{counter}")
-                # clients x splits x trees x nodes_current_depth x feature x n_bins
+            self.send_data_to_coordinator([local_scores, local_counts, only_class], memo=f"local_scores_{counter}")
 
             # local scores -> global scores
             if self.is_coordinator:
                 result = self.gather_data(memo=f"local_scores_{counter}")
-                global_split_scores = client.coord_aggregate_split_scores(client_split_scores=\
+                global_split_scores, global_leaf_info = client.coord_aggregate_split_scores(client_split_scores=\
                                                         [result[i][0] for i in range(len(result))],
                                                     sample_count_per_client=\
-                                                        [result[i][1] for i in range(len(result))])
-                self.broadcast_data(global_split_scores, send_to_self=True)
+                                                        [result[i][1] for i in range(len(result))],
+                                                    only_class_per_client=[result[i][2] for i in range(len(result))])
+                self.broadcast_data((global_split_scores, global_leaf_info), send_to_self=True)
 
-            global_split_scores = self.await_data()
-            # set nodes and find local leaves
-            # TODO
-
-            if self.is_coordinator:
-                # local leaves -> global leaves
-                # TODO
-                raise NotImplementedError("TODO: implement the global leaf calculation")
-
-            # find global leaves and set the new current depth nodes
-            # TODO
-
+            global_split_scores, global_leaf_info = self.await_data()
+            # set nodes/leafs and create new nodes
+            client.update_current_depth_nodes(
+                global_best_split=global_split_scores,
+                global_leaf_info=global_leaf_info
+            )
             # check if we are done too escape the loop
-            # TODO
+            if client.check_finished():
+                break
 
-
-            # TODO: continue here
+            # TODO: continue here with the evaluation part
             # TODO: all attributes in the model that are only used during construction should
             # 1. be set with the _ prefix
             # 2. be set to None after they are not needed anymore (sample_idcs, feature_idcs, ...)
@@ -155,7 +144,8 @@ class InitialState(AppState):
             # we itereate the cur_level_nodes, calc split_scores, aggregate them, set the next_level_nodes
             # find the leaves of the cur_level_nodes, set them, then set cur_level_nodes to next_level_nodes
             # and clear next_level_nodes
-
+            # TODO: make sure that when creating nodes, they have their parent set correctly
+            # also ensure theire parents point to them!
 
 
 
@@ -169,6 +159,7 @@ class InitialState(AppState):
         # correctly updated!!!
         # Also, the predict function of the RF was never double checked, it might still have
         # e.g. indexing errors and might not work with the new structure of the model
+        # TODO: regression is neither tested nor really implemented, maybe just remove it for now
 
 
 

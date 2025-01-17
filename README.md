@@ -50,7 +50,6 @@ fc_random_forest:
   n_estimators: 100 # number of trees in the forest
   max_depth: 10 # maximum depth of the tree
   min_samples_split: 2 # minimum number of samples required to split an internal node
-  min_samples_leaf: 1 # minimum number of samples required to be at a leaf node
   max_features: 'sqrt' # number of features to consider when looking for the best split
   max_samples: 0.75 # percentage of samples to draw for each decision tree
   bootstrap: True # whether bootstrap samples are used when building trees

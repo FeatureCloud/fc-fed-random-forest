@@ -53,7 +53,6 @@ class FedHistRandomForestClient():
              f"Split directory: {self.split_dir}; Number of estimators: {self.n_estimators}; "+\
              f"Criterion: {self.criterion}; Max depth: {self.max_depth}; " +\
              f"Min samples split: {self.min_samples_split}; " +\
-             f"Min samples leaf: {self.min_samples_leaf}; " +\
              f"Max features: {self.__max_features_raw}; Bootstrap: {self.bootstrap}; " +\
              f"Max samples: {self.max_samples_raw}; Random state: {self.random_state}; " +\
              f"Prediction mode: {self.prediction_mode}; Quantile: {self.__quantile_idcs_raw}; " +\
@@ -116,7 +115,7 @@ class FedHistRandomForestClient():
         self.fixed_width_idcs = np.setdiff1d(np.arange(self.num_features), self.quantile_idcs)
 
         # calculate the num_features and max_features
-        self.n_features = X[0].shape[1]
+        self.n_features = int(X[0].shape[1]) # int function for the type checker
         if isinstance(self.__max_features_raw, str):
             if self.__max_features_raw == 'sqrt':
                 self.max_features = int(np.sqrt(self.n_features))
@@ -183,10 +182,10 @@ class FedHistRandomForestClient():
         self.global_stddevs: Optional[List[np.ndarray]] = None
             # splits x num_features (stddevs per feature)
         self.__X_hist_transposed: Optional[List[np.ndarray]] = None
-            # splits x num_samples x num_features (histogram bin indexes)
+            # splits x num_features x num_samples (histogram bin indexes)
             # values are the bin indexes the sample belongs to for each feature
         self.X_hist: Optional[List[np.ndarray]] = None
-            # splits x num_features x num_samples (histogram bin indexes)
+            # splits x num_samples x num_features (histogram bin indexes)
             # values are the bin indexes the sample belongs to for each feature
         self.global_classes: Optional[np.ndarray] = None
             # (num_classes) the classes that are available globally
@@ -538,13 +537,8 @@ class FedHistRandomForestClient():
                              random_state=self.random_state,
                              max_depth=self.max_depth,
                              min_samples_split=self.min_samples_split,
-                             min_samples_leaf=self.min_samples_leaf,
                              bootstrap=self.bootstrap,
                              feat_idcs=self.RF_feat_idcs,
-                             n_patients_local=self.X_hist[split_idx].shape[0],
-                             n_patients_global=self.global_counts[split_idx][0],
-                                # MISSING_VALUES_SUPPORT: don't use the first features entry
-                                # but use the info for all features
                              max_samples=self.max_samples,
                              quantile=self.quantile_idcs,
                              global_mean=self.global_means[split_idx],
@@ -553,11 +547,15 @@ class FedHistRandomForestClient():
                              prediction_mode=self.prediction_mode,
                              oob=self.oob,
                              class_weights=self.class_weights[split_idx] \
-                                if self.class_weights else None)
+                                if self.class_weights else None,
+                            X_hist=self.X_hist[split_idx],
+                            y=self.y[split_idx],
+                            num_bins=self.n_bins)
             self.rf_models.append(rf_model)
 
     def get_current_level_splitscores(self) -> Tuple[List[List[List[List[List[float]]]]],
-                                                    List[List[List[List[int]]]]]:
+                                                    List[List[List[List[int]]]],
+                                                    List[List[Optional[List[Optional[Any]]]]]]:
         """
         Returns the split scores of all RandomForest models. Only calculates the one of the current
         level of each tree. Throws an error if the current level is already set, except if the
@@ -568,6 +566,11 @@ class FedHistRandomForestClient():
                 n_features x n_bins):
                 The scores of the trees for the current level of all possible splits by bins
             counts: List[List[List[List[int]]]] (splits x n_estimators x n_nodes x n_features):
+                The amount of samples in the corresponding node
+            only_class: List[Optional[List[List[Optional[Any]]]]] (splits x n_estimators x n_nodes):
+                If the corresponding node only has samples of one target class, then this
+                contains this target class. Otherwise, it is None.
+                The whole array of nodes might be None if the tree is finished.
         """
         if not self.rf_models:
             raise ValueError('The forest has not been initialized yet')
@@ -575,17 +578,17 @@ class FedHistRandomForestClient():
             raise ValueError('Binning information must be set before calculating split scores')
         scores = []
         counts = []
+        only_classes = []
         for split_idx, rf_model in enumerate(self.rf_models):
-            score, count = rf_model.get_split_scores(X_Hist=self.X_hist[split_idx],
-                                                    y=self.y[split_idx],
-                                                    n_bins=self.n_bins)
+            score, count, only_class = rf_model.get_split_scores()
             scores.append(score)
             counts.append(count)
-        return scores, counts
+            only_classes.append(only_class)
+        return scores, counts, only_classes
 
-    def set_current_depth_nodes(self,
-                                global_best_split: List[List[Optional[List[Tuple[int, int, float]]]]]) \
-                                -> List[List[Optional[List[int]]]]:
+    def update_current_depth_nodes(self,
+                                global_best_split: List[List[Optional[List[Tuple[int, int, float]]]]],
+                                global_leaf_info: List[List[Optional[List[int]]]]) -> None:
         """
         Based on the globally calculated best splits, sets the current nodes of the trees.
         Sets their threshold, score and feature index.
@@ -594,11 +597,20 @@ class FedHistRandomForestClient():
         The leaf information needs to be aggregated by the coordinator to finally set the
         current depth nodes.
 
-        Returns:
-            leaf_info: List[List[List[int]]] (splits x n_estimators x num_leaf_nodes):
+        Args:
+            global_best_split: List[List[Optional[List[Tuple[int, int, float]]]]]
+                (splits x n_estimators x n_nodes):
+                Per split, tree and node contains the best split
+                The final tuple is (feature_idx, bin_idx, score)
+            leaf_info: List[List[Optional[List[int]]]] (splits x n_estimators x num_leaf_nodes):
                 The leaf information of the nodes. Per split, per tree, contains the indexes in
                 current_depth_nodes that are leaf nodes. If the tree is finished, None is returned
                 for this tree.
+
+        Returns:
+            None, just sets the leaf status of the current_depth_nodes, creates children and
+            sets them as the new current_depth_nodes
+            Also checks if the tree is finished and sets the tree.finished attribute
         """
         if not self.rf_models:
             raise ValueError('The forest has not been initialized yet')
@@ -608,12 +620,24 @@ class FedHistRandomForestClient():
             raise ValueError('Global classes must be set before setting nodes')
         if not self.global_means or not self.global_stddevs or not self.global_counts:
             raise ValueError('Global statistics must be set before setting nodes')
-        local_leaves = []
         for split_idx, rf_model in enumerate(self.rf_models):
-            estimator_leaf_nodes = rf_model.set_currently_unset_nodes(global_best_split[split_idx])
-            local_leaves.append(estimator_leaf_nodes)
-        return local_leaves
+            rf_model.set_currently_unset_nodes(global_best_split[split_idx], global_leaf_info[split_idx])
 
+
+    def check_finished(self) -> bool:
+        """
+        Checks whether all models of all splits are finished
+
+        Returns:
+            bool: True if all models are finished, False otherwise
+        """
+        if not self.rf_models:
+            raise ValueError('The forest has not been initialized yet. Cannot check if its done')
+        for rf_model in self.rf_models:
+            finished = rf_model.check_finished()
+            if not finished:
+                return False
+        return True
 
     def coord_ensure_config_alignment(self,
                                       feature_names: List[List[str]],
@@ -872,8 +896,10 @@ class FedHistRandomForestClient():
 
     def coord_aggregate_split_scores(self,
                                      client_split_scores: List[List[List[Optional[List[List[float]]]]]],
-                                     sample_count_per_client: List[List[List[Optional[List[List[int]]]]]]) \
-            -> List[List[Optional[List[Tuple[int, int, float]]]]]:
+                                     sample_count_per_client: List[List[List[Optional[List[List[int]]]]]],
+                                     only_class_per_client: List[List[List[Optional[List[Optional[Any]]]]]]) \
+            -> Tuple[List[List[Optional[List[Tuple[int, int, float]]]]],
+                     List[List[int]]]:
         """
         Aggregates the split scores from all clients to a global split score.
         The split score per client was calculated by self.get_current_level_splitscores.
@@ -886,10 +912,23 @@ class FedHistRandomForestClient():
             sample_count_per_client: List[List[List[List[List[int]]]]]
                 (clients x splits x n_estimators x n_nodes x n_features):
                 The sample counts per client. Same order of clients as client_split_scores.
+            only_class_per_client: List[List[Optional[List[List[Optional[Any]]]]]]
+                (clients x splits x n_estimators x n_nodes):
+                If the corresponding node only has samples of one target class, then this
+                contains this target class. Otherwise, it is None. Might be None for a whole tree
+                if the tree is finished.
+
         Returns:
+            Tuple[global_split_scores, leaf_status]:
             global_split_scores: List[List[List[Tuple[int, int, float]]]]
                 (splits x n_estimators x n_nodes x (feature_idx, bin_idx, score)):
+                For each node, the feature index, bin index and score of the best split.
+            leaf_status: List[List[int]]
+                (splits x n_estimators x n_leaf_nodes):
+                Contains the indexes in current_depth_nodes that have been determined to be
+                leaf nodes.
         """
+        #TODO: determine the leaf status here, also using the only_class info
         if not self.rf_models:
             raise ValueError('The forest has not been initialized yet')
         if not self.X_hist:
@@ -897,9 +936,12 @@ class FedHistRandomForestClient():
 
         global_split_scores = []
             # split x n_estimators x n_nodes x (feature_idx, bin_idx, score)
+        leaf_status_per_split = []
         for split_idx, _ in enumerate(self.X_hist):
             tree_scores = []
+            leaf_status_per_tree = []
             for tree_idx, tree in enumerate(self.rf_models[split_idx].iterate_trees()):
+                leaf_status_per_node = []
                 node_scores = []
                 if tree.finished:
                     # ensure that no client sent any data for this tree
@@ -913,7 +955,12 @@ class FedHistRandomForestClient():
                 if not all([specific_client_split_score[split_idx][tree_idx] is not None \
                             for specific_client_split_score in client_split_scores]):
                     raise ValueError(f'Not all clients sent data for the tree {tree_idx}')
-
+                if not all([specific_client_sample_count[split_idx][tree_idx] is not None \
+                            for specific_client_sample_count in sample_count_per_client]):
+                    raise ValueError(f'Not all clients sent sample counts for the tree {tree_idx}')
+                if not all([specific_client_only_class[split_idx][tree_idx] is not None \
+                            for specific_client_only_class in only_class_per_client]):
+                    raise ValueError(f'Not all clients sent only class info for the tree {tree_idx}')
                 for node_idx, _ in enumerate(tree.iterate_cur_depth_nodes()):
                     split_scores = [d[split_idx][tree_idx][node_idx] for d in client_split_scores] #type: ignore
                         # clients x features x n_bins
@@ -938,10 +985,47 @@ class FedHistRandomForestClient():
                         # back to the original (sum_split_score.shape) shape
                     min_score = np.min(sum_split_score)
                     node_scores.append((feature_idx, bin_idx, min_score))
+                    # now we need to decide whether this node is a leaf node
+                    # only one class
+                    only_classes = [d[split_idx][tree_idx][node_idx] for d in only_class_per_client] #type: ignore
+                        # list of length clients, containing either None or the only class
+                    # get all unique classes
+                    only_classes = {class_i for class_i in only_classes if class_i is not None}
+                    if len(only_classes) == 1:
+                        leaf_status_per_node.append(node_idx)
+                        continue
+                    # max_depth reached
+                    # get the node
+                    node = tree.get_cur_depth_node(node_idx)
+                    if node.depth >= self.rf_models[split_idx].__max_depth - 1:
+                        # max_depth is 1 indexed, depth is 0 indexed
+                        leaf_status_per_node.append(node_idx)
+                        continue
+                    # min_samples_split reached
+                    if total_counts[feature_idx] < self.rf_models[split_idx].__min_samples_split:
+                        leaf_status_per_node.append(node_idx)
+                        continue
+                    # min_samples_leaf reached
+                    # TODO: implement this at some point. Check this node as if it were a leaf
+                    # if it has too little samples, the parent must be turned into a leaf and the
+                    # parents other child needs to be removed!
+                    # probably needs a new structure of what is returned here, e.g. not only the
+                    # index of leaves but per index the information if the leaf_status is this
+                    # node or the parent node
+                    # min_impurity_decrease
+                    # get the parents score
+                    if node.parent:
+                        # only works for non root nodes
+                        parent_score = node.parent.score
+                        if parent_score - min_score < self.rf_models[split_idx].min_impurity_decrease:
+                            leaf_status_per_node.append(node_idx)
+                            continue
                 tree_scores.append(node_scores)
+                leaf_status_per_tree.append(leaf_status_per_node)
             global_split_scores.append(tree_scores)
+            leaf_status_per_split.append(leaf_status_per_tree)
 
-        return global_split_scores
+        return global_split_scores, leaf_status_per_split
 
     def _read_config(self, config: dict):
         """
@@ -981,7 +1065,6 @@ class FedHistRandomForestClient():
             self.criterion: str = config.get('criterion', 'gini')
             self.max_depth: int = int(config.get('max_depth', 10))
             self.min_samples_split: int = config.get('min_samples_split', 2)
-            self.min_samples_leaf: int = config.get('min_samples_leaf', 1)
             self.__max_features_raw: Union[str, float, int] = config.get('max_features', 'sqrt')
             self.bootstrap: bool = config.get('bootstrap', True)
             self.max_samples_raw: Union[None, float, int] = config.get('max_samples', None)
