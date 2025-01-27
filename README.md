@@ -46,7 +46,7 @@ fc_random_forest:
   split:
     mode: directory # directory if cross validation was used before, else file
     dir: data # data if cross validation app was used before, else .
-  mode: classification # classification or regression
+  mode: classification # only classification is supported right now
   n_estimators: 100 # number of trees in the forest
   max_depth: 10 # maximum depth of the tree
   min_samples_split: 2 # minimum number of samples required to split an internal node

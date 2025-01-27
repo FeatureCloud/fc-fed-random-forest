@@ -9,7 +9,7 @@ import os
 from typing import Optional, Union, List, Tuple, Dict, Any
 import logging
 from copy import deepcopy
-import joblib
+import inspect
 
 import bios
 import numpy as np
@@ -404,9 +404,9 @@ class FedHistRandomForestClient():
         per feature for the quantile features and returns them.
 
         Args:
-            global_means: List[List[float]] (splits x num_features):
+            global_means: List[List[float]] (splits x n_quantile_features):
                 The global mean for each feature.
-            global_counts: List[List[int]] (splits x num_features):
+            global_counts: List[List[int]] (splits x n_quantile_features):
                 The global sample count for each feature.
         """
         self.global_means = [np.array(d) for d in global_means]
@@ -639,10 +639,147 @@ class FedHistRandomForestClient():
                 return False
         return True
 
+    def get_leaf_node_samples(self) -> List[List[List[List[int]]]]:
+        """
+        Receives the local potential predicted classes per leaf. The order of the leaf nodes
+        is given by performing DFS on the tree nodes until leaf nodes are reached.
+
+        Returns:
+            List[List[int]]: Per split, per tree, per leaf node contains the amount of
+                samples per class in the leaf node. Per node, the list indexes are the same
+                then the class indexes.
+        """
+        if not self.check_finished() or not self.rf_models:
+            raise ValueError("Trying to set leaf node values before finishing the tree")
+        leaf_samples: List[List[List[List[int]]]] = []
+        for model in self.rf_models:
+            leaf_samples.append(model.get_leaf_node_samples())
+        return leaf_samples
+
+    def set_final_leaf_nodes(self, global_leaf_samples: List[List[List[int]]]) -> None:
+        """
+        Given the global classes predicted by the leaf nodes, sets the leaf nodes
+
+        Args:
+            global_leaf_samples: List[List[List[int]]] (splits x n_estimators x num_leaf_nodes):
+                The class_idx for each leaf node in each tree in each split
+        """
+        if not self.rf_models:
+            raise ValueError('The forest has not been trained yet')
+        for split_idx, rf_model in enumerate(self.rf_models):
+            if not rf_model.check_finished():
+                raise ValueError('The model is not finished yet')
+            rf_model.set_final_leaf_nodes(global_leaf_samples[split_idx])
+
+
+    def calc_oob(self) -> List[List[Tuple[int, int]]]:
+        """
+        Calculates the oob error rate for the random forest.
+
+        Returns:
+        (split x n_estimators): The oob error rate for each estimator in each split.
+        Per tree, the tuple contains the number of incorrect predictions and the number of oob samples.
+        """
+        if not self.rf_models:
+            raise ValueError('The forest has not been initialized yet')
+        if not self.check_finished():
+            raise ValueError('The forest is not finished yet, cannot calculate oob')
+        if not self.oob:
+            raise ValueError('OOB settings must be set to calculate oob')
+        oob = []
+        for rf_model in self.rf_models:
+            oob.append(rf_model.calc_oob())
+        return oob
+
+    def write_rf_model_class(self) -> None:
+        """
+        Writes the RandomForest.py class to the output folder.
+        """
+        with open(f'{self.outputfolder}/RandomForest.py', 'w') as f:
+            f.write(inspect.getsource(RandomForest))
+
+    def evaluate_local(self) -> None:
+        """
+        Evaluates the random forest model on the test data. Saves the wanted output, either
+        just the model, just the predictions or both.
+
+        Args:
+            X_test: np.ndarray (num_splis x num_samples x num_features): The test data.
+            y_test: np.ndarray (num_splits x num_samples): The test labels.
+
+        Returns:
+        Tuple[List[np.number], List[np.number], List[int]]
+            Each tuple contains a list where the index is the split index. The lists are:
+                acc: The accuracy of the model.
+                mcc: The Matthews correlation coefficient of the model.
+                counts: List[int]: The sample counts per split.
+        """
+        if not self.rf_models:
+            raise ValueError('The forest has not been initialized yet')
+        if not self.check_finished():
+            raise ValueError('The forest is not finished yet, cannot predict yet')
+        if not self.global_classes:
+            raise ValueError('Global classes must be set before evaluating')
+        if not self.global_means or not self.global_stddevs or not self.global_counts:
+            raise ValueError('Global statistics must be set before evaluating')
+        X_test = self.X_test
+        y_test = self.y_test
+        if len(X_test) != len(self.rf_models) != len(y_test):
+            raise ValueError('The number of splits differs between test data and models')
+
+        for split_idx, rf_model in enumerate(self.rf_models):
+            X_test_split = X_test[split_idx]
+            y_test_split = y_test[split_idx]
+
+            # predict the test data
+            predictions = rf_model.predict(X=X_test_split)
+
+            # save the information
+            self.write_output(split_idx=split_idx,
+                              y_test=y_test_split,
+                              predictions=predictions)
+
+
+    def write_output(self,
+                     split_idx: int,
+                     y_test: np.ndarray,
+                     predictions: np.ndarray) -> None:
+        """
+        Writes the output of the predictions to a files. Also saves the model if wanted.
+        Output depends on self.output_format.
+
+        Args:
+            split_idx: int: The index of the split.
+            y_test: np.ndarray: The true labels.
+            predictions: np.ndarray: The predicted labels.
+        """
+        # save the model if wanted
+        basepath = self.outputfolder
+        if not self.rf_models:
+            raise ValueError('The forest has not been initialized yet, but trying to save the model')
+        if 'model' in self.output_mode:
+            modelpath = f'{basepath}/model.pkl'
+            if self.split_mode == 'directory':
+                modelpath = f'{basepath}/model_split_{split_idx}.pkl'
+            self.rf_models[split_idx].save_model(modelpath)
+
+        # save the predictions
+        if 'pred' in self.output_mode:
+            y_test_series = pd.Series(y_test)
+            predictions_series = pd.Series(predictions)
+            if self.split_mode == 'directory':
+                y_test_series.to_csv(f'{basepath}/y_test_split_{split_idx}.csv', index=False)
+                predictions_series.to_csv(f'{basepath}/predictions_split_{split_idx}.csv', index=False)
+            else:
+                y_test_series.to_csv(f'{basepath}/y_test.csv', index=False)
+                predictions_series.to_csv(f'{basepath}/predictions.csv', index=False)
+
+
     def coord_ensure_config_alignment(self,
                                       feature_names: List[List[str]],
                                       quantile_idcs: List[List[int]],
-                                      fixed_width_idcs: List[List[int]]) -> None:
+                                      fixed_width_idcs: List[List[int]],
+                                      oobs: List[bool]) -> None:
         """
         Receives the feature names, quantile indices and fixed width indices
         of all different clients and ensures they are the same.
@@ -667,6 +804,8 @@ class FedHistRandomForestClient():
                   f"{set.intersection(*[set(f) for f in fixed_width_idcs])}")
             print(f"UNION of fixed width indices: {set.union(*[set(f) for f in fixed_width_idcs])}")
             raise ValueError('Fixed width indices do not match between clients')
+        if not all([oobs[0] == oob for oob in oobs]):
+            raise ValueError('OOB settings do not match between clients')
 
     def coord_ensure_same_num_splits(self,
                                      fixed_width_binning_bounds: List[List[Any]],
@@ -754,9 +893,9 @@ class FedHistRandomForestClient():
 
         Returns:
             Tuple[List[np.ndarray], List[np.ndarray]]:
-                broadcast_means: List[np.ndarray] (splits x num_features):
+                broadcast_means: List[np.ndarray] (splits x n_quantile_features):
                     The global mean for each feature.
-                sample_counts: List[np.ndarray] (splits x num_features):
+                sample_counts: List[np.ndarray] (splits x n_quantile_features):
                     The global sample count for each feature.
         """
         means = []
@@ -770,15 +909,15 @@ class FedHistRandomForestClient():
         for split_idx, _ in enumerate(self.X):
             try:
                 mean_count_arr = np.array([d[split_idx] for d in data])
-                # format is clients x num_features x 2, we removed the split
+                # format is clients x n_quantile_features x 2, we removed the split
                 # axis due to the split loop
             except IndexError as e:
                 raise ValueError('The number of splits differ between clients') from e
             global_matrix = np.sum(mean_count_arr, axis=0)
                 # we sum over the clients axis, new format is num_features x 2
-            accumulated_sample_count = global_matrix[:, 0] # vector of shape num_features
-            accumulated_sum = global_matrix[:, 1] # vector of shape num_features
-            mean = accumulated_sum / accumulated_sample_count # vector of shape num_features
+            accumulated_sample_count = global_matrix[:, 0] # vector of shape n_quantile_features
+            accumulated_sum = global_matrix[:, 1] # vector of shape n_quantile_features
+            mean = accumulated_sum / accumulated_sample_count # vector of shape n_quantile_features
             means.append(mean)
             sample_counts.append(accumulated_sample_count)
         self.global_means = means
@@ -790,11 +929,11 @@ class FedHistRandomForestClient():
         Aggregates the standard deviations from all clients to a global standard deviation.
 
         Args:
-            stddevs: List[np.ndarray] (clients x splits x num_features):
+            stddevs: List[np.ndarray] (clients x splits x n_quantile_features):
                 The standard deviation for each feature per client.
 
         Returns:
-            List[np.ndarray] (splits x num_features): The global standard deviation.
+            List[np.ndarray] (splits x n_quantile_features): The global standard deviation.
         """
         global_stddevs = []
         for split_idx, _ in enumerate(self.X):
@@ -928,7 +1067,6 @@ class FedHistRandomForestClient():
                 Contains the indexes in current_depth_nodes that have been determined to be
                 leaf nodes.
         """
-        #TODO: determine the leaf status here, also using the only_class info
         if not self.rf_models:
             raise ValueError('The forest has not been initialized yet')
         if not self.X_hist:
@@ -1027,6 +1165,76 @@ class FedHistRandomForestClient():
 
         return global_split_scores, leaf_status_per_split
 
+    def coord_aggregate_leaf_samples(self,
+                                     gathered_leaf_samples: List[List[List[List[List[int]]]]]) \
+                                    -> List[List[List[int]]]:
+        """
+        Finds for all leave nodes of the global model which global_class the leaf corresponds to.
+
+        Args:
+            gathered_leaf_samples: List[List[List[Dict[int, int]]]] (clients x splits x trees x
+                leaf_nodes): Per leaf node, the amount of samples per class as a
+                Dict[class] = frequency.
+
+        Returns:
+            List[List[List[int]]] (splits x trees x leaf_nodes): per leaf node the class_idx which
+            globally has the highest frequency
+        """
+        gathered_leaf_samples_np = np.array(gathered_leaf_samples)
+        # we need to collapse the clients axis
+        gathered_leaf_samples_np = np.sum(gathered_leaf_samples_np, axis=0)
+        # now we can find the class with the highest frequency
+        # we need to get the index of the last dimension with the highest value in that dimension
+        # this is the class index
+        leaf_classes = np.argmax(gathered_leaf_samples_np, axis=-1)
+        return leaf_classes
+
+    def coord_aggregate_oob(self, gathered_oob_errors: List[List[List[Tuple[int, int]]]]) -> \
+            List[List[float]]:
+        """
+        Calculates the oob error rate for the random forest globally and returns the weights of
+        all trees
+
+        Args:
+            gathered_oob_errors: List[List[List[Tuple[int, int]]]]
+                (clients x splits x trees x (error, num_oob_samples)):
+                The amount of incorrect oob sample predictions for each estimator in each split.
+                Per tree, the tuple contains the number of incorrect predictions and the number of
+                oob samples.
+
+        Returns:
+            List[List[float]] (splits x trees):
+                The weight of each tree in the random forest of each split.
+        """
+        #TODO: implement the aggregation of the oob errors
+        # collapse the client axis
+        gathered_oob_errors_np = np.array(gathered_oob_errors)
+        gathered_oob_errors_np = np.sum(gathered_oob_errors_np, axis=0)
+            # shape is splits x trees x 2
+        # in the last dimension (error, num_oob_samples) we need to calculate the weight
+        # the weight is simply the number of (1 - the incorrect predictions divided by the number of oob samples)
+        error_rate = gathered_oob_errors_np[:, :, 0] / gathered_oob_errors_np[:, :, 1]
+        weights = 1 - error_rate
+        return weights
+
+    def update_weights(self, weights: List[List[float]]) -> None:
+        """
+        Updates the RF_models weights with the given weights.
+
+        Args:
+            weights: List[List[float]] (splits x trees): The weights of the trees.
+
+        Returns:
+            None, updates the weights in the RF_models.
+        """
+        if not self.rf_models:
+            raise ValueError('The forest has not been initialized yet')
+        if len(weights) != len(self.rf_models):
+            raise ValueError('The number of splits differ between the weights and the models')
+        for split_idx, rf_model in enumerate(self.rf_models):
+            rf_model.set_weights(weights[split_idx])
+
+
     def _read_config(self, config: dict):
         """
         Reads the configuration file and sets the parameters for the random forest.
@@ -1074,11 +1282,11 @@ class FedHistRandomForestClient():
             self.oob: bool = config.get('oob', False)
 
             self.prediction_mode: str = config['mode']
-            if self.prediction_mode not in ['classification', 'regression']:
-                raise ValueError('Mode must be either "classification" or "regression"')
-            if self.prediction_mode == 'regression' and self.weight_classes_bool:
-                raise ValueError('Weights are not supported for regression, " +\
-                                 "there are no classes to weight in regression')
+            if self.prediction_mode != 'classification':
+                raise ValueError('Mode must be "classification"')
+            # if self.prediction_mode == 'regression' and self.weight_classes_bool:
+            #     raise ValueError('Weights are not supported for regression, " +\
+            #                      "there are no classes to weight in regression')
 
             n_bins: Union[str, int] = config['n_bins']
             try:

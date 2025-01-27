@@ -5,10 +5,6 @@ import os
 import joblib
 from scipy.stats import norm
 from FeatureCloud.app.engine.app import AppState, app_state, Role
-from helper.io import read_config, read_files
-from helper.util import validate_input_data
-from RandomForest.models import RandomForest, Node
-from RandomForest.splitting import split_score
 from typing import Union, List
 from copy import deepcopy
 from src.client import FedHistRandomForestClient
@@ -19,7 +15,9 @@ from logging import getLogger
 @app_state('initial', Role.BOTH)
 class InitialState(AppState):
     """
-    TODO: description
+    The only state used
+    Trains a random forest in a federated manner.
+    All clients train the same trees together. Binning is used.
     """
 
     def register(self):
@@ -29,11 +27,13 @@ class InitialState(AppState):
         ### Initializing the app
         self.update(message='Read files', progress=0.05)
         client = FedHistRandomForestClient()
+        oob = client.oob
         quantile_binning_aggregation = client.get_quantile_binning_aggregation()
         fixed_width_binning_bounds = client.get_fixed_width_binning_bounds()
 
         self.send_data_to_coordinator([quantile_binning_aggregation, fixed_width_binning_bounds,
-                                       list(client.feature_names), list(client.quantile_idcs), list(client.fixed_width_idcs)])
+                                       list(client.feature_names), list(client.quantile_idcs), list(client.fixed_width_idcs),
+                                       oob], send_to_self=True)
         if self.is_coordinator:
             ### Binning: Get means, split points (fixed-width-binning) and sample counts
             gathered_initial_data = self.gather_data()
@@ -44,9 +44,11 @@ class InitialState(AppState):
             feature_names = [gathered_initial_data[i][2] for i in range(len(gathered_initial_data))]
             quantile_idcs = [gathered_initial_data[i][3] for i in range(len(gathered_initial_data))]
             fixed_width_idcs = [gathered_initial_data[i][4] for i in range(len(gathered_initial_data))]
+            oobs = [gathered_initial_data[i][5] for i in range(len(gathered_initial_data))]
             client.coord_ensure_config_alignment(feature_names=feature_names,
                                                 quantile_idcs=quantile_idcs,
-                                                fixed_width_idcs=fixed_width_idcs)
+                                                fixed_width_idcs=fixed_width_idcs,
+                                                oobs=oobs)
             client.coord_ensure_same_num_splits(fixed_width_binning_bounds=fixed_width_binning_bounds,
                                                 quantile_binning_aggregation=quantile_binning_aggregation)
             split_points_fixed_width = \
@@ -123,560 +125,40 @@ class InitialState(AppState):
                 global_leaf_info=global_leaf_info
             )
             # check if we are done too escape the loop
+            # this is done locally, but all clients should finish at the same time
+            # as they just used the global data to set the globally synced models
             if client.check_finished():
+                # finish the models by defining the leaves
+                leaf_samples = client.get_leaf_node_samples()
+                    # splits x n_estimators x n_leaf_nodes x Dict[class_i] = frequency
+                self.send_data_to_coordinator(leaf_samples, send_to_self=True)
+                if self.is_coordinator:
+                    gathered_leaf_samples: List[List[List[List[List[int]]]]] = self.gather_data()
+                        # clients x splits x n_estimators x n_leaf_nodes x
+                        # List[idx: global_class_idx, val: frequency]
+                    global_leaf_samples = client.coord_aggregate_leaf_samples(gathered_leaf_samples)
+                    self.broadcast_data(global_leaf_samples, send_to_self=True)
+                # update the models with the leaf nodes
+                global_leaf_samples: List[List[List[int]]] = self.await_data()
+                client.set_final_leaf_nodes(global_leaf_samples)
                 break
 
-            # TODO: continue here with the evaluation part
-            # TODO: all attributes in the model that are only used during construction should
-            # 1. be set with the _ prefix
-            # 2. be set to None after they are not needed anymore (sample_idcs, feature_idcs, ...)
-            # equivalent in the old code is in aggregate_splits after the self.broadcast_data(global_splits, send_to_self=False)
-            # careful, here is where node.samples MUST be set correctly!!!
-            # It should be set for the current depth nodes, then after the stopping criteria stuff
-            # we should set the next depth nodes and their samples correctly
-            # TODO: we should really be sure the indexing is done correctly here
-            # maybe we have a string indexing for nodes and their children?
-            # e.g. level 2 nodes index is:
-            # comnplete_index = level_0_parent_idx$level_1_parent_idx$own_index
-            # own_index = own_index
-            # alternatively:
-            # Per tree we have the cur_level_nodes and the next_level_nodes
-            # we itereate the cur_level_nodes, calc split_scores, aggregate them, set the next_level_nodes
-            # find the leaves of the cur_level_nodes, set them, then set cur_level_nodes to next_level_nodes
-            # and clear next_level_nodes
-            # TODO: make sure that when creating nodes, they have their parent set correctly
-            # also ensure theire parents point to them!
-
-
-
-        #TODO:
-        # after adding the  stopping criteria stuff, when calculating split scores and when aggregating them
-        # we need to mark leaf nodes/finnished trees correctly and set the samples correctly
-        # Missing bugs to fix:
-        # The splitscore should be calculated correctly using the correct sampleset, not always
-        # the full decision trees sampleset
-        # for that we need to ensure when adding a new node to the tree that the sampleset is
-        # correctly updated!!!
-        # Also, the predict function of the RF was never double checked, it might still have
-        # e.g. indexing errors and might not work with the new structure of the model
-        # TODO: regression is neither tested nor really implemented, maybe just remove it for now
-
-
-
-
-
-
-
-
-
-
-
-        return 'terminal'
-
-
-@app_state('aggregate_splits', Role.BOTH)
-class AggregateSplitState(AppState):
-    """
-    The coordinator receives the local split scores from each client, aggreagtes them and
-    chooses the feature-threshold combination with the minimal score value for splitting.
-    The participants receive the best feature-threshold combination for splitting the data
-    and they split the data based on the received feature and threshold.
-    """
-
-    def register(self):
-       self.register_transition('local_stopping_criteria', Role.BOTH)
-
-    def run(self):
-        if self.is_coordinator:
-            rf_models = self.load('rf_models')
-            data = self.gather_data()
-                # split x tree x nodes_current_depth x feature x n_bins
-            global_splits = []
-                # split x tree x nodes_current_depth x feature x [feature, threshold, score]
-            counter_split = 0
-
-            for split in range(len(self.load('X_hist'))):
-                rf_model = rf_models[split]
-                tmp_split = []
-                if not rf_model.finished:
-                    counter_dt = 0
-                    for decision_tree in rf_model.decision_trees:
-                        tmp_dt = []
-                        if not decision_tree.finished:
-                            nodes = decision_tree.cur_depth_nodes
-                            for node in range(len(nodes)):
-                                split_scores = [np.array(data[i][counter_split][counter_dt][node]) \
-                                        for i in range(len(data))]
-                                    # clients x features x n_bins
-                                sum_split_score = np.sum(split_scores, axis=0)
-                                    # features x n_bins
-                                best_split = [np.unravel_index(np.argmin(sum_split_score), \
-                                            sum_split_score.shape), np.min(sum_split_score)]
-                                    #
-                                tmp_dt.append(best_split)
-                            counter_dt = counter_dt + 1
-                            tmp_split.append(tmp_dt)
-                    counter_split = counter_split + 1
-                    if len(tmp_split) > 0:
-                        global_splits.append(tmp_split)
-            self.broadcast_data(global_splits, send_to_self=False)
-        else:
-            global_splits = self.await_data()
-
-        rf_models = self.load('rf_models')
-        depth = self.load('depth')
-        max_depth = self.load('max_depth')
-        X_hist = self.load('X_hist')
-        y = self.load('y')
-        counter_split = 0
-
-        for split in range(len(X_hist)):
-            rf_model = rf_models[split]
-            if not rf_model.finished:
-                counter_dt = 0
-                for decision_tree in rf_model.decision_trees:
-                    if not decision_tree.finished:
-                        depth_nodes = decision_tree.cur_depth_nodes
-                        next_depth_nodes = []
-                        for dn, node in enumerate(depth_nodes):
-                            node.feature = decision_tree.feat_idcs[global_splits\
-                                                            [counter_split][counter_dt][dn][0][0]]
-                            node.threshold = global_splits[counter_split][counter_dt][dn][0][1]
-                            node.score = global_splits[counter_split][counter_dt][dn][1]
-
-                            left_idcs = np.where(X_hist[split][node.samples, node.feature] <= \
-                                                 node.threshold)[0]
-                            right_idcs = np.where(X_hist[split][node.samples, node.feature] > \
-                                                  node.threshold)[0]
-                            left_child = Node(depth+1, node.samples[left_idcs])
-                            right_child = Node(depth+1, node.samples[right_idcs])
-
-                            if((len(left_idcs) == 0) or len(np.unique(y[split][node.samples\
-                                                                            [left_idcs]])) == 1):
-                                left_child.local_leaf = True
-                            if((len(right_idcs) == 0) or len(np.unique(y[split][node.samples\
-                                                                            [right_idcs]])) == 1):
-                                right_child.local_leaf = True
-
-                            node.left = left_child
-                            node.left.parent = node
-                            node.right = right_child
-                            node.right.parent = node
-                            next_depth_nodes.append(left_child)
-                            next_depth_nodes.append(right_child)
-
-                        decision_tree.next_depth_nodes = next_depth_nodes
-
-                        counter_dt = counter_dt + 1
-
-                counter_split = counter_split + 1
-
-        self.store('rf_models', rf_models)
-        self.store('depth', depth+1)
-
-        self.update(message=f'Depth {depth+1} of {max_depth}', progress=float(depth / max_depth))
-
-        return 'local_stopping_criteria'
-
-
-@app_state('local_stopping_criteria', Role.BOTH)
-class LocalStoppingCriteria(AppState):
-    """
-    Check if a node is already a leaf node.
-    """
-
-    def register(self):
-        self.register_transition('stopping_criteria', Role.BOTH)
-
-    def run(self):
-        rf_models = self.load('rf_models')
-        stopping_criteria = []
-
-        for split in range(len(self.load('X_hist'))):
-            tmp_split = []
-            rf_model = rf_models[split]
-            if not rf_model.finished:
-                for decision_tree in rf_model.decision_trees:
-                    if not decision_tree.finished:
-                        local_leaves = list(map(lambda node: 1 if node.local_leaf else 0, \
-                                                decision_tree.next_depth_nodes))
-                        n_samples = [len(node.samples) for node in decision_tree.next_depth_nodes]
-                        tmp_split.append([local_leaves, n_samples])
-
-                if len(tmp_split) > 0:
-                    stopping_criteria.append(tmp_split)
-        self.send_data_to_coordinator(stopping_criteria)
-
-        return 'stopping_criteria'
-
-
-@app_state('stopping_criteria', Role.BOTH)
-class StoppingCriteria(AppState):
-
-    """
-    The coordinator receives from each participant if a node is already a local leaf node
-    and aggregates the information to check if a node is a global leaf node.
-    The participants reveive information whether to stop or continue building the decision tree.
-    """
-
-    def register(self):
-        self.register_transition('find_local_splits', Role.BOTH)
-        self.register_transition('compute_global_leaves', Role.BOTH)
-
-    def run(self):
-
-        if self.is_coordinator:
-            # Aggregate stopping criteria
-            rf_models = self.load('rf_models')
-            min_samples_split = self.load('min_samples_split')
-            min_samples_leaf = self.load('min_samples_leaf')
-
-            data = self.gather_data()
-            cur_global_leaves = []
-            next_global_leaves = []
-            del_next = []
-            counter_split = 0
-
-            for split in range(len(self.load('X_hist'))):
-                rf_model = rf_models[split]
-                if not rf_model.finished:
-                    split_cur_global_leaves = []
-                    split_next_global_leaves = []
-                    split_del_next = []
-                    counter_dt = 0
-
-                    for decision_tree in rf_model.decision_trees:
-                        if not decision_tree.finished:
-                            dt_cur_global_leaves = np.empty((0,))
-                            dt_next_global_leaves = np.empty((0,))
-                            dt_del_next = np.empty((0,))
-
-                            n_samples = [np.array(data[i][counter_split][counter_dt][1]) for i in \
-                                        range(len(data))]
-                            aggr_n_samples = np.sum(n_samples, axis=0)
-
-                            idcs_min_split = np.where(aggr_n_samples < min_samples_split)[0]
-                            if len(idcs_min_split) > 0:
-                                dt_next_global_leaves = np.union1d(dt_next_global_leaves, \
-                                                               idcs_min_split)
-
-                            idcs_min_leaf = np.where(aggr_n_samples < min_samples_leaf)[0]
-                            if len(idcs_min_leaf) > 0:
-                                parent = np.floor(idcs_min_leaf / 2)
-                                dt_cur_global_leaves = np.union1d(dt_cur_global_leaves, parent)
-                                dt_del_next = np.union1d(dt_del_next, 2 * parent)
-                                dt_del_next = np.union1d(dt_del_next, 2 * parent + 1)
-
-                            n_local_leaves = [np.array(data[i][counter_split][counter_dt][0]) for i \
-                                            in range(len(data))]
-                            aggr_n_local_leaves = np.sum(n_local_leaves, axis=0)
-                            idcs_all_local_leaves = np.where(aggr_n_local_leaves == \
-                                                         len(self.clients))[0]
-                            if len(idcs_all_local_leaves) > 0:
-                                dt_next_global_leaves = np.union1d(dt_next_global_leaves, \
-                                                               idcs_all_local_leaves)
-                            split_cur_global_leaves.append(dt_cur_global_leaves)
-                            split_next_global_leaves.append(dt_next_global_leaves)
-                            split_del_next.append(dt_del_next)
-                            counter_dt = counter_dt + 1
-
-                    cur_global_leaves.append(split_cur_global_leaves)
-                    next_global_leaves.append(split_next_global_leaves)
-                    del_next.append(split_del_next)
-
-                    counter_split = counter_split + 1
-            data = [cur_global_leaves, next_global_leaves, del_next]
-            self.broadcast_data(data, send_to_self=False)
-
-        else:
-            data = self.await_data()
-
-        rf_models = self.load('rf_models')
-        depth = self.load('depth')
-        max_depth = self.load('max_depth')
-
-        counter_split = 0
-
-        for split in range(len(self.load('X_hist'))):
-            rf_model = rf_models[split]
-            if not rf_model.finished:
-                counter_dt = 0
-                for decision_tree in rf_model.decision_trees:
-                    if not decision_tree.finished:
-                        cur_depth_nodes = decision_tree.cur_depth_nodes
-                        next_depth_nodes = decision_tree.next_depth_nodes
-                        global_cur_depth_nodes = data[0][counter_split][counter_dt]
-                        global_next_depth_nodes = data[1][counter_split][counter_dt]
-                        del_next = data[2][counter_split][counter_dt]
-
-                        for node in global_cur_depth_nodes.astype(int):
-                            cur_depth_nodes[node].global_leaf = True
-                            decision_tree.leaves.append(cur_depth_nodes[node])
-
-                        for node in global_next_depth_nodes.astype(int):
-                            next_depth_nodes[node].global_leaf = True
-                            decision_tree.leaves.append(next_depth_nodes[node])
-
-                        for node in del_next.astype(int):
-                            next_depth_nodes[node].parent.left = None
-                            next_depth_nodes[node].parent.right = None
-                            next_depth_nodes[node].parent = None
-
-                        remove_from_next = np.concatenate((global_next_depth_nodes, del_next))
-
-                        new_next_depth_nodes = [node for idx, node in enumerate(next_depth_nodes) \
-                                                if idx not in remove_from_next]
-
-                        if max_depth is not None and depth == max_depth:
-                            decision_tree.next_depth_nodes = []
-
-                        elif len(new_next_depth_nodes) == 0:
-                            decision_tree.finished = True
-                            decision_tree.cur_depth_nodes = []
-                            decision_tree.next_depth_nodes = []
-
-                        else:
-                            decision_tree.cur_depth_nodes = new_next_depth_nodes
-                            decision_tree.next_depth_nodes = []
-
-                        counter_dt = counter_dt + 1
-
-                if all(decision_tree.finished for decision_tree in rf_model.decision_trees):
-                    rf_model.finished = True
-
-                counter_split = counter_split + 1
-
-        all_finished = all(rf_model.finished for rf_model in rf_models)
-
-        if all_finished or max_depth is not None and depth == max_depth:
-            self.update(message='Get leaf nodes')
-            return 'compute_global_leaves'
-
-        return 'find_local_splits'
-
-
-@app_state('compute_global_leaves', Role.BOTH)
-class ComputeGlobalLeavesState(AppState):
-    """
-    Each participant calculates the leaf node values and sends them to the coordinator.
-    """
-
-    def register(self):
-        self.register_transition('construct_global_rf', Role.BOTH)
-
-    def run(self):
-        rf_models = self.load('rf_models')
-        y = self.load('y')
-        classes = self.load('classes')
-        leave_values = []
-
-        if self.load('max_depth') is not None:
-            for split in range(len(self.load('X_hist'))):
-                rf_model = rf_models[split]
-                for decision_tree in rf_model.decision_trees:
-                    decision_tree.leaves.extend(decision_tree.cur_depth_nodes)
-                    for node in decision_tree.cur_depth_nodes:
-                        node.global_leaf = True
-
-        for split in range(len(self.load('X_hist'))):
-            rf_model = rf_models[split]
-            tmp_split = []
-            for decision_tree in rf_model.decision_trees:
-                tmp_dt = []
-                for leaf in decision_tree.leaves:
-                    if self.load('prediction_mode') == 'classification':
-                        labels = np.sum(y[split][leaf.samples][:, np.newaxis] == classes, axis=0)
-                    else:
-                        if len(y[split][leaf.samples]) > 0:
-                            labels = [np.mean(y[split][leaf.samples]), 1]
-                        else:
-                            labels = [0, 0]
-                    tmp_dt.append(labels)
-                tmp_split.append(tmp_dt)
-            leave_values.append(tmp_split)
-
-        self.send_data_to_coordinator(leave_values)
-
-        return 'construct_global_rf'
-
-
-@app_state('construct_global_rf', Role.BOTH)
-class ConstructGlobalLeavesState(AppState):
-    """
-    The coordinator aggregates the leaf node values and sends the global values to each
-    participant.
-    Construct global RandomForest(s) and set samples to None for privacy.
-    """
-
-    def register(self):
-        self.register_transition('calculate_local_oob', Role.BOTH)
-        self.register_transition('write', Role.BOTH)
-
-    def run(self):
-        if self.is_coordinator:
-            gathered_data = self.gather_data()
-            leaf_values = []
-
-            for split in range(len(self.load('X_hist'))):
-                tmp_split = []
-                for dt in range(self.load('n_estimators')):
-                    local_values = [np.array(gathered_data[j][split][dt]) for j in \
-                                    range(len(gathered_data))]
-                    summed_values = np.sum(local_values, axis=0)
-
-                    if self.load('prediction_mode') == 'classification':
-                        global_values = [np.argmax(summed_values[i]) for i in range(len(summed_values))]
-                    else:
-                        values = np.array([summed_values[i][0] for i in range(len(summed_values))])
-                        n_clients = np.array([summed_values[i][1] for i in range(len(summed_values))])
-                        global_values = values / n_clients
-
-                    tmp_split.append(global_values)
-                leaf_values.append(tmp_split)
-
-            self.broadcast_data(leaf_values, send_to_self=False)
-
-        else:
-            leaf_values = self.await_data()
-
-        rf_models = self.load('rf_models')
-        classes = self.load('classes')
-
-        for split in range(len(self.load('X_hist'))):
-            rf_model = rf_models[split]
-            for dt, decision_tree in enumerate(rf_model.decision_trees):
-                decision_tree.samples = None
-                for l, leaf in enumerate(decision_tree.leaves):
-                    if self.load('prediction_mode') == 'classification':
-                        leaf.value = classes[leaf_values[split][dt][l]]
-                    else:
-                        leaf.value = leaf_values[split][dt][l]
-
-        if self.load('oob'):
-            return 'calculate_local_oob'
-
-        return 'write'
-
-
-@app_state('calculate_local_oob', Role.BOTH)
-class CalculateLocalOOBState(AppState):
-
-    def register(self):
-        self.register_transition('get_global_oob', Role.BOTH)
-
-    def run(self):
-        rf_models = self.load('rf_models')
-        X_hist = self.load('X_hist')
-        y = self.load('y')
-        local_oob_error = []
-        for split in range(len(self.load('X_hist'))):
-            rf_model = rf_models[split]
-            tmp_split = []
-            for decision_tree in rf_model.decision_trees:
-                all = np.arange(len(y[split]))
-                oob_samples = all[~np.isin(all, decision_tree.samples)]
-                y_pred = decision_tree.predict(X_hist[split][oob_samples])
-                y_true = y[split][oob_samples]
-                oob_error = np.sum(y_pred != y_true)
-                tmp_split.append([oob_error, len(y[split])])
-            local_oob_error.append(tmp_split)
-
-        self.send_data_to_coordinator(local_oob_error)
-
-        return 'get_global_oob'
-
-
-@app_state('get_global_oob', Role.BOTH)
-class AggregateOOBState(AppState):
-
-    def register(self):
-        self.register_transition('write', Role.BOTH)
-
-    def run(self):
-        if self.is_coordinator:
-            gathered_data = self.gather_data()
-            weights = []
-            for split in range(len(self.load('X_hist'))):
-                tmp_dt = []
-                for dt in range(self.load('n_estimators')):
-                    local_values = [np.array(gathered_data[j][split][dt]) for j in \
-                                    range(len(gathered_data))]
-                    oob = np.sum(local_values, axis=0)
-                    global_oob = oob[0] / oob[1]
-                    global_acc = 1 - global_oob
-                    tmp_dt.append(global_acc)
-
-                normalized_oob_acc = tmp_dt / np.sum(tmp_dt)
-                weights.append(normalized_oob_acc)
-
-            self.broadcast_data(weights, send_to_self=False)
-
-        else:
+        # in case of oob, calculation the local oob error (+ counts)
+        if client.oob:
+            # calculate the local oob error (incorrectly classified samples, total samples)
+            oob_errors = client.calc_oob()
+            self.send_data_to_coordinator(oob_errors, send_to_self=True)
+            if self.is_coordinator:
+                # aggregate them into weights (1-(sum of wrong predictions/total predictions))
+                gathered_oob_errors = self.gather_data()
+                weights = client.coord_aggregate_oob(gathered_oob_errors)
+                self.broadcast_data(weights, send_to_self=True)
             weights = self.await_data()
+            # update the weights
+            client.update_weights(weights)
 
-        rf_models = self.load('rf_models')
-        for split in range(len(self.load('X_hist'))):
-            rf_model = rf_models[split]
-            for dt, decision_tree in enumerate(rf_model.decision_trees):
-                decision_tree.weight = weights[split][dt]
-        return 'write'
-
-
-@app_state('write', Role.BOTH)
-class WriteState(AppState):
-    """
-    Save the trained RandomForest(s) to a file.
-    """
-
-    def register(self):
-        self.register_transition('terminal', Role.BOTH)
-
-    def run(self):
-        self.update(message='Writing Output')
-        rf_models = self.load('rf_models')
-        X_test = self.load('X_test')
-        y_true = self.load('y_test')
-        output_mode = self.load('output_mode')
-
-        def write_output(path, data):
-            df = pd.DataFrame(data=data)
-            df.to_csv(path, index=False, sep=self.load('sep'))
-
-        base_dir_in = os.path.normpath(os.path.join('/mnt/input/', self.load('split_dir')))
-        base_dir_out = os.path.normpath(os.path.join('/mnt/output/', self.load('split_dir')))
-
-        if self.load('split_mode') == 'directory':
-            for i, split_name in enumerate(os.listdir(base_dir_in)):
-                rf_model = rf_models[i]
-                if output_mode in ['pred', 'model+pred']:
-                    y_pred = rf_model.predict(X_test[i])
-                    os.makedirs(os.path.join(base_dir_out, split_name), exist_ok=True)
-                    write_output(os.path.join(base_dir_out, split_name, self.load('pred')), \
-                                {'pred': y_pred})
-                    write_output(os.path.join(base_dir_out, split_name, self.load('test_output')), \
-                                {'y_true': y_true[i]})
-                if output_mode in ['model', 'model+pred']:
-                    joblib.dump(rf_model, os.path.join(base_dir_out, split_name, 'rf_model.pkl'))
-        elif self.load('split_mode') == 'file':
-            rf_model = rf_models[0]
-            if output_mode in ['pred', 'model+pred']:
-                y_pred = rf_model.predict(X_test[0])
-                write_output(os.path.join(base_dir_out, self.load('pred')), {'pred': y_pred})
-                write_output(os.path.join(base_dir_out, self.load('test_output')), \
-                            {'y_true': y_true[0]})
-            if output_mode in ['model', 'model+pred']:
-                joblib.dump(rf_model, os.path.join(base_dir_out, 'rf_model.joblib'))
-            # as a user potentially has no access to the rf_model class
-            # they cannot use the model yet
-            # Therefore, we also save the source code of the model class to the
-            # output directory
-            # this is a bit hacky tbh, but probably the easiest to be able
-            # to really actually use the model
-            import RandomForest.models as model_definition
-            import inspect
-
-            if output_mode in ['model', 'model+pred']:
-                with open(os.path.join(base_dir_out, 'rf_model.py'), 'w') as f:
-                    f.write(inspect.getsource(model_definition))
-
+        # evaluate locally
+        # predict and save the results
+        client.evaluate_local()
+        client.write_rf_model_class()
         return 'terminal'

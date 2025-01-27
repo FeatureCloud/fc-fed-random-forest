@@ -1,8 +1,9 @@
 from typing import Optional, Union, Dict, Any, List, Iterator, Tuple
 
 import numpy as np
-from scipy import stats
+import joblib
 # pylint: disable=too-many-instance-attributes, invalid-name
+import inspect
 
 class RandomForest:
     """
@@ -45,8 +46,8 @@ class RandomForest:
             bootstrap: whether to use bootstrap samples
             random_state: the random seed to use
             quantile: List of feature indices using quantile binning
-            global_mean: global mean for each feature (n_estimators x n_features)
-            global_stddev: global standard deviation for each feature (n_estimators x n_features)
+            global_mean: global mean for each feature (n_estimators x n_quantile_features)
+            global_stddev: global standard deviation for each feature (n_estimators x n_quantile_features)
             split_points: The threshold values for each feature.
                 Dimensions are n_features x n_bins - 1 as the values min and max are excluded:
                     ]min, val1, ..., max[
@@ -117,70 +118,125 @@ class RandomForest:
         sample_idcs = np.random.choice(n_patients_local, sample_size, replace=self.__bootstrap)
         return sample_idcs
 
-    def predict(self, X):
-        raise NotImplementedError('Not yet implemented.')
-        #TODO: double check this, this funcction was not verified!!!
-        bucket_idcs = np.setdiff1d(np.arange(len(X[0])), self.__quantile)
+    def get_leaf_node_samples(self) -> List[List[List[int]]]:
+        """
+        Receives the local potential predicted classes per leaf. The order of the leaf nodes
+        is given by performing DFS on the tree nodes until leaf nodes are reached.
 
-        if len(bucket_idcs) > 0:
-            # Bucket Binning
-            bucket__split_points = self.__split_points[bucket_idcs, :]
+        Returns:
+            For each tree in the forest, for each leaf node, a list of the frequencies of the
+            global_classes in the leaf node. The index of the returned list corresponds to the index
+            of the global classes.
+        """
+        if not self.__y:
+            raise ValueError('No y data to calculate the leaf node samples.')
+        tree_leaves = []
+        for estimator in self.__decision_trees:
+            tree_leaves.append(estimator.get_leaf_node_samples(y=self.__y))
+        return tree_leaves
 
-            X_T_bucket = np.transpose(X[:, bucket_idcs])
-            # Assign data points to bins
-            X_hist_bucket = np.array([np.digitize(X_T_bucket[i], bucket__split_points[i]) \
-                                        for i in range(X_T_bucket.shape[0])]) - 1
+    def set_final_leaf_nodes(self, global_leaf_samples: List[List[int]]):
+        """
+        Given the global classes predicted by the leaf nodes, sets the leaf nodes
 
-        if len(self.__quantile) > 0:
-            # Quantile Binning
-            a = (X[:, self.__quantile] - self.__global_mean)
-            b = self.__global_stddev
-            normalized = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
-            normalized[normalized == np.inf] = 0
-            normalized[normalized == -np.inf] = 0
-            normalized[normalized == np.nan] = 0
+        Args:
+            global_leaf_samples: List[List[int]] (n_estimators x num_leaf_nodes):
+                The class_idx for each leaf node in each tree in each split
+        """
+        if len(global_leaf_samples) != len(self.__decision_trees):
+            raise ValueError('Number of trees does not match the number of global leaf trees.')
+        for tree_idx, tree_data in enumerate(global_leaf_samples):
+            tree = self.__decision_trees[tree_idx]
+            for leaf_node, leaf_class_idx in zip(tree._traverse_tree_dfs_leaves(), tree_data):
+                leaf_node.value = self.__global_classes[leaf_class_idx]
 
-            quantile__split_points = self.__split_points[self.__quantile, :]
-            X_T__quantile = np.transpose(normalized)
-            # Assign data points to bins
-            X_hist__quantile = np.array([np.digitize(X_T__quantile[i], quantile__split_points[i]) \
-                                        for i in range(X_T__quantile.shape[0])])
 
-        if len(bucket_idcs) > 0 and len(self.__quantile) > 0:
-            X_hist = np.concatenate((X_hist__quantile, X_hist_bucket))
-            # Place the values of array at specified indices
-            X_hist[self.__quantile] = X_hist__quantile
-            X_hist[bucket_idcs] = X_hist_bucket
-            X_hist = np.transpose(X_hist)
+    def calc_oob(self) -> List[Tuple[int, int]]:
+        """
+        Calculate the out-of-bag error for the random forest.
 
-        elif len(bucket_idcs) > 0:
-            X_hist = np.transpose(X_hist_bucket)
+        Returns:
+            List[Tuple[int, int]]: List of tuples of the incorrect samples and the total oob samples
+                for each tree in the forest.
+        """
+        if not self.__oob:
+            raise ValueError('OOB error is not used but the oob calculation is called')
+        if not self.__X_hist or not self.__y:
+            raise ValueError('No data to calculate the oob error.')
+        oob_errors = []
+        for tree in self.__decision_trees:
+            if not tree.finished:
+                raise ValueError('Tree is not finished, cannot calculate oob error.')
+            wrong_predictions, total_oob_samples = tree.calc_oob_error(
+                X_hist=self.__X_hist,
+                y=self.__y)
+            oob_errors.append((wrong_predictions, total_oob_samples))
+        return oob_errors
 
-        else:
-            X_hist = np.transpose(X_hist__quantile)
 
-        # Make predictions with every tree in the forest
-        y = np.array([tree.predict(X_hist) for tree in self.__decision_trees])
-        # Reshape so we can find the most common value
-        y = np.swapaxes(y, axis1=0, axis2=1)
+    def predict(self,
+                X: np.ndarray) -> np.ndarray:
+        """
+        Given the input data X, predict the target values. The input data should have the same
+        columns as the data used for training the model (in the same order).
+        Automatically performs z-score normalization for the quantile binned features.
+        Then uses that data to predict using the decision trees.
 
-        if self.prediction_mode == 'classification':
-            if not self.__oob:
-                # Use majority voting for the final prediction
-                predicted_values = stats.mode(y, axis=1, keepdims=True)[0].reshape(-1)
-            else:
-                predicted_values = []
-                classes = np.unique(y)
-                for i in range(len(X_hist)):
-                    counter = []
-                    for c in classes:
-                        indices = np.where(y[i] == c)[0]
-                        counter.append(np.sum([self.__decision_trees[j].weight for j in indices]))
-                    predicted_values.append(classes[np.argmax(counter)])
-        else:
-            predicted_values = np.mean(y, axis=0)
+        Args:
+            X: input data, 2d array of shape (n_samples, n_features).
 
+        Returns:
+        np.ndarray: the predicted target values. Length is n_samples.
+        """
+        # normalize the data
+        X = self.normalize(X)
+
+        # predict each tree
+        predicted_values = np.array([tree.predict(X) for tree in self.__decision_trees])
+            # n_estimators x n_samples
+        # we switch the axes to have the samples as the first axis
+        predicted_values = np.swapaxes(predicted_values, axis1=0, axis2=1)
+            # n_samples x n_estimators
+        weights = np.array([tree.__weight for tree in self.__decision_trees])
+
+        # apply the weights and make the final prediction
+        sum_predicted_classes = np.zeros((len(X), len(self.__global_classes)))
+            # n_samples x n_classes, for each sample the sum of the predicted classes
+        for class_idx, cl in self.__global_classes:
+            sum_predicted_classes[:, class_idx] = np.sum((predicted_values == cl) * weights, axis=1)
+                # for each class, sum the weights of the trees * if the corresponding class is
+                # predicted by the tree
+                # this works because the True is seen as 1 and the False as 0
+        predicted_values = np.argmax(sum_predicted_classes, axis=1)
+            # we go from n_samples x n_classes to n_samples by taking the index of the highest value
+        # now we translate from class_idx to the actual class
+        predicted_values = predicted_values.map(lambda x: self.__global_classes[x])
         return predicted_values
+
+
+    def normalize(self, X: np.ndarray):
+        """
+        Normalizes all quantile binning features in X using the global mean and standard deviation.
+
+        Args:
+            X: input data, 2d array of shape (n_samples, n_features).
+
+        Returns:
+            np.ndarray: the normalized input data X.
+            Formula is the z-score: (X - mean) / stddev
+        """
+        # get quantile specific data
+        X_quantile = X[:, self.__quantile]
+        a = (X_quantile - self.__global_mean)
+        b = self.__global_stddev
+        normalized = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
+        normalized[normalized == np.inf] = 0
+        normalized[normalized == -np.inf] = 0
+        normalized[normalized == np.nan] = 0
+
+        # replace the quantile data with the normalized data
+        X[:, self.__quantile] = normalized
+        return X
 
     def iterate_trees(self) -> Iterator["DecisionTree"]:
         """
@@ -269,7 +325,6 @@ class RandomForest:
                     raise ValueError('Leaf nodes should not be in the current depth nodes when setting this nodes.')
                 # set node to leaf if necessary
                 if node_idx in relevant_leaf_idxs:
-                    node.set_leaf_node()
                     # done with this node
                     continue
                 # update the node and create the children correctly
@@ -289,6 +344,16 @@ class RandomForest:
             # update the current depth nodes to the next depth nodes
             tree.update_cur_depth_nodes(next_depth_nodes)
 
+    def set_weights(self, weights: List[float]) -> None:
+        """
+        Set the weights of the trees in the forest.
+        """
+        if len(weights) != self.n_estimators:
+            raise ValueError('Number of weights does not match the number of trees.')
+        for tree_idx, tree in enumerate(self.__decision_trees):
+            tree.__weight = weights[tree_idx]
+
+
     def check_finished(self):
         """
         Check if all trees are finished.
@@ -304,8 +369,6 @@ class RandomForest:
         self.__y = None
         self.__class_weights = None
         self.__split_points = None
-        self.__global_mean = None
-        self.__global_stddev = None
         self.finished = True
         return True
 
@@ -315,6 +378,29 @@ class RandomForest:
         #TODO: finnish this
         """
         raise NotImplementedError('Not yet implemented.')
+
+    def cleanup_model(self):
+        """
+        Removes any traces of the training process. Should be called before sharing this model!
+        """
+        self.__split_points = None
+        self.__class_weights = None
+        self.__X_hist = None
+        self.__y = None
+        for tree in self.__decision_trees:
+            tree._cleanup_tree()
+
+    def save_model(self, path: str):
+        """
+        Cleanes the model and saves it to the given basepath as model.pkl.
+        Uses joblib to save the model.
+        """
+        # cleanup
+        self.cleanup_model()
+
+        # save the model as well as this class
+        joblib.dump(self, path)
+
 
 
 class DecisionTree:
@@ -338,7 +424,7 @@ class DecisionTree:
         self.__min_samples_split = min_samples_split
         self.__feat_idcs = feat_idcs
         self.finished = False
-        self.__weight = 1
+        self.__weight:float = 1.0
         self.__global_classes = global_classes
         self.__class_weights = class_weights
 
@@ -363,7 +449,15 @@ class DecisionTree:
         Predict the target values for the input data X (2d array).
         Assumes the same features with the same indices as the training data.
         """
-        return np.array([self._traverse_tree(x, self.root) for x in X])
+        return np.array([self._traverse_tree_predict(x, self.root) for x in X])
+
+    def predict_hist(self,
+                     X_hist: np.ndarray):
+        """
+        Predict the target values for the input data X_hist (2d array).
+        Assumes the same features with the same indices as the training data.
+        """
+        return np.array([self._traverse_tree_predict_hist(x, self.root) for x in X_hist])
 
     def iterate_cur_depth_nodes(self) -> Iterator["Node"]:
         """
@@ -436,6 +530,55 @@ class DecisionTree:
             self.__class_weights = None
             self.finished = True
 
+    def get_leaf_node_samples(self, y: np.ndarray) -> List[int]:
+        """
+        Receives the local potential predicted classes per leaf. The order of the leaf nodes
+        is given by performing DFS on the tree nodes until leaf nodes are reached.
+
+        Returns:
+            List[int]: For each leaf node, contains the frequencies of the global_classes
+            in the leaf node. The index of the returned list corresponds to the index of the
+            global classes.
+            The leaf interation is done via _traverse_tree_dfs
+        """
+        leaves = []
+        for node in self._traverse_tree_dfs_leaves():
+            y_node = y[node.__sample_idcs, :]
+            class_frequencies = np.sum(y_node[:, np.newaxis] == self.__global_classes, axis=0)
+            # go from y_node 1d array of len num_samples to 2d array of shape (num_samples, 1)
+            # then compare each element with the global classes, creating a boolean array
+            # of shape (num_samples, num_classes)
+            # then sum over the samples to get the frequency of each class
+            leaves.append(class_frequencies)
+        return leaves
+
+
+    def calc_oob_error(self,
+                       X_hist: np.ndarray,
+                       y: np.ndarray) -> Tuple[int, int]:
+        """
+        Calculates the oob error of this tree. Predicts the samples, then returns the amount of
+        incorrect samples and the total samples.
+
+        Args:
+            X: input data, 2d array of shape (n_samples, n_features).
+            y: target data, 1d array of shape (n_samples), indicating the target value
+
+        Returns:
+            Tuple[int, int]: the amount of incorrect samples and the total amount of oob samples
+        """
+        # TODO
+        # 1. get the oob samples
+        # 2. predict the oob samples
+        # 3. return the amount of incorrect samples and the total oob samples
+        if not self.root.__sample_idcs:
+            raise ValueError('No sample indices for this trees root.')
+        oob_samples = np.setdiff1d(np.arange(len(X_hist)), self.root.__sample_idcs)
+        predicted_values = self.predict_hist(X_hist[oob_samples])
+        incorrect_samples = np.sum(predicted_values != y[oob_samples])
+        return incorrect_samples, len(oob_samples)
+
+
 
     def _check_leaf_node_consistency(self, node):
         """
@@ -453,15 +596,79 @@ class DecisionTree:
         self._check_leaf_node_consistency(node.left)
         self._check_leaf_node_consistency(node.right)
 
-    def _traverse_tree(self, x, node):
+    def _traverse_tree_predict_hist(self, x_hist: np.ndarray, node: "Node"):
         """
-        Traverse the tree to find the leaf node for the input data x, effectively making a prediction.
+        Traverse the tree to find the leaf node for the input data x_hist, effectively making a prediction.
+
+        Args:
+            x_hist: contains one single raw, the data is not the actual data but the bin_idxes
+                each value belongs to.
         """
+        if len(x_hist) != 1:
+            raise ValueError("Function must be called with only a singular raw")
         if node.is_leaf_node():
             return node.value
-        if x[node.feature] <= node.threshold:
-            return self._traverse_tree(x, node.left)
-        return self._traverse_tree(x, node.right)
+        if not node.feature_idx or not node.threshold or not node.left or not node.right or not node.bin_idx:
+            raise ValueError('Node is not set correctly')
+        if x_hist[node.feature_idx] <= node.bin_idx:
+            return self._traverse_tree_predict_hist(x_hist, node.left)
+        return self._traverse_tree_predict_hist(x_hist, node.right)
+
+    def _traverse_tree_predict(self, x: np.ndarray, node: "Node"):
+        """
+        Traverse the tree to find the leaf node for the input data x, effectively making a prediction.
+
+        Args:
+            x: contains one single raw
+        """
+        if len(x) != 1:
+            raise ValueError("Function must be called with only a singular raw")
+        if node.is_leaf_node():
+            return node.value
+        if not node.feature_idx or not node.threshold or not node.left or not node.right:
+            raise ValueError('Node is not set correctly')
+        if x[node.feature_idx] <= node.threshold:
+            return self._traverse_tree_predict(x, node.left)
+        return self._traverse_tree_predict(x, node.right)
+
+    def _traverse_tree_dfs_leaves(self):
+        """
+        Traverse the tree in a depth-first search manner and return only the leaf nodes.
+        """
+        for node in self._traverse_tree_dfs():
+            if node.is_leaf_node():
+                yield node
+
+    def _traverse_tree_dfs(self):
+        """
+        Traverse the tree in a depth-first search manner.
+        """
+        yield from self._traverse_tree_dfs_helper(self.root)
+
+    def _traverse_tree_dfs_helper(self, node: "Node"):
+        """
+        Helper function for the depth_first_search.
+        Returns the given node, then the left child, then the right child.
+        Recursive
+        """
+        yield node
+        if node.is_leaf_node():
+            if not node.left or not node.right:
+                raise ValueError("A leaf node has children")
+            yield self._traverse_tree_dfs_helper(node.left)
+            yield self._traverse_tree_dfs_helper(node.right)
+
+    def _cleanup_tree(self):
+        """
+        When a tree is finished, this function cleans up the tree of any private variables that are
+        not needed anymore.
+        """
+        if not self.finished:
+            raise ValueError('Tree is not finished, but trying to clean it')
+        self.__cur_depth_nodes = []
+        self.__class_weights = None
+        for node in self._traverse_tree_dfs():
+            node._cleanup_node()
 
 
 class Node:
@@ -581,16 +788,14 @@ class Node:
         self.left = left_child
         self.right = right_child
 
-        # remove somewhat private variables
-        self._cleanup_node()
         return left_child, right_child
 
-    def set_leaf_node(self) -> None:
+    def set_leaf_node(self, value) -> None:
         """
         Set the node as a leaf node.
         """
         self.global_leaf = True
-        self._cleanup_node()
+        self.value = value
         if self.left or self.right:
             raise ValueError('Leaf node has children.')
         if self.feature_idx or self.bin_idx or self.threshold or self.score:
