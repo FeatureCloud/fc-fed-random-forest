@@ -1248,7 +1248,7 @@ class FedHistRandomForestClient():
             config_name = "config.yml"
             if not os.path.exists(f'{self.inputfolder}/{config_name}'):
                 config_name = "config.yaml"
-            config = bios.read(f'{self.outputfolder}/{config_name}')
+            config = bios.read(f'{self.inputfolder}/{config_name}')
         try:
             config = config['fc-rand-forest']
 

@@ -5,6 +5,11 @@ A Random Forest FeautureCloud app, allowing an iterative federated computation o
 Supports single-class classification. The multiclass classification and regression are to be added. 
 Does not support missing data.
 
+## Usage
+The app can either be used with FeatureCloud or to run a federated simulation locally natively without docker.
+Check the `run_app_simulation.py` file to see how to use this, you can use the `run_simulation_native` function from that file to run a native simulation.
+The data must be given in different folders for each simulated client.
+
 ## Input
 - train.csv containing the local training data (columns: features; rows: samples)
 - test.csv containing the local test data
