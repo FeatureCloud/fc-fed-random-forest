@@ -96,7 +96,7 @@ class FedHistRandomForestClient():
             # otherwise just a single dataset
             train_file = os.path.join(self.inputfolder, self.train_filename)
             test_input_file = os.path.join(self.inputfolder, self.test_input_filename)
-            X_, y_, X_test_, y_test_, self.feature_names_ = \
+            X_, y_, X_test_, y_test_, self.feature_names = \
                 self._read_files(train_file, test_input_file)
             self.num_features = X_.shape[1]
             validate_input_data(X_, y_, X_test_, y_test_, self.num_features)
@@ -207,6 +207,7 @@ class FedHistRandomForestClient():
                 First entry in the second dimension is the array of lower bounds,
                 second entry is the array of upper bounds.
         """
+        self.logging_class.info('Calculating fixed width binning bounds...')
         result = []
         for split_data in self.X:
             split_data = split_data[:, self.fixed_width_idcs]
@@ -242,6 +243,9 @@ class FedHistRandomForestClient():
         Returns:
             None, just sets self.X_hist of the self.fixed_width_idcs
         """
+        self.logging_class.info('Setting fixed width bins...')
+        # set the split_points for later
+        self.__split_points_fixed_width = np.array(global_split_points)
         if self.__X_hist_transposed is None:
             self.__X_hist_transposed = []
         for split_idx, X in enumerate(self.X):
@@ -286,15 +290,17 @@ class FedHistRandomForestClient():
             global_stddevs: List[List[float]] (splits x num_features):
                 The global standard deviation for each feature.
         """
-        if not self.__X_hist_transposed:
+        self.logging_class.info('Setting quantile bins...')
+        if self.__X_hist_transposed is None:
             raise ValueError('Fixed width binning must be set before quantile binning')
-        if not self.global_means:
+        if self.global_means is None:
             raise ValueError('Global means must be set before quantile binning')
-        if not self.global_counts:
+        if self.global_counts is None:
             raise ValueError('Global counts must be set before quantile binning')
-        if not self.__split_points_fixed_width:
+        if self.__split_points_fixed_width is None:
             raise ValueError('Fixed width binning must be set before quantile binning')
         X_normalized = []
+        self.global_stddevs = [np.array(d) for d in global_stddevs]
         for split_idx, split_data in enumerate(self.X):
             # we z-score normalize the data
             # formula: (x_i - mean) / stddev
@@ -330,33 +336,35 @@ class FedHistRandomForestClient():
             # to the value x at which all values <= x together make up 25% of all values
             # norm.ppf does this for us
             # 1d array of length n_bins - 1
+        if len(self.quantile_idcs) > 0:
+            # otherwise we get mismatching shapes
+            for split_idx, split_data in enumerate(X_normalized):
+                X_T = np.transpose(split_data)
+                    # format is features_quantile x samples
+                    # X_normalized is already just the quantile features
+                # Assign data points to bins
+                print(f"X_T shape: {X_T.shape}")
+                X_hist_transposed_quantile = np.array([np.digitize(X_T[feature_idx], split_points_quantile) \
+                                        for feature_idx in range(X_T.shape[0])])
+                    # Reminder: the split points are the interval ]min, 1, ..., max[
+                    # we do not need to supply the min and max value, as according
+                    # to the documentation of np.digitize:
+                    # If values in x are beyond the bounds of split_points,
+                    # 0 or len(split_points) is returned as appropriate.
+                    # The interval ]min, 1, ..., max[ has n_bins - 1 split points
+                    # therefore we end up with bin indexes 0, ..., n_bins - 1
+                    # so with exactly n_bins bins
+                    # the value 0 is therefore membership of that sample for that
+                    # feature of the bin 0
+                    # which is perfect for our purposes
+                    # format is features_quantile x samples
+                if len(self.__X_hist_transposed) <= split_idx or \
+                    self.__X_hist_transposed[split_idx].shape[0] != self.num_features or \
+                    self.__X_hist_transposed[split_idx].shape[1] != self.X[split_idx].shape[0]:
+                    raise ValueError('Fixed width binning must be set before quantile binning')
 
-        for split_idx, split_data in enumerate(X_normalized):
-            X_T = np.transpose(split_data[split_idx, :])
-                # format is features_quantile x samples
-                # X_normalized is already just the quantile features
-            # Assign data points to bins
-            X_hist_transposed = np.array([np.digitize(X_T[i], split_points_quantile) \
-                                    for i in range(X_T.shape[0])])
-                # Reminder: the split points are the interval ]min, 1, ..., max[
-                # we do not need to supply the min and max value, as according
-                # to the documentation of np.digitize:
-                # If values in x are beyond the bounds of split_points,
-                # 0 or len(split_points) is returned as appropriate.
-                # The interval ]min, 1, ..., max[ has n_bins - 1 split points
-                # therefore we end up with bin indexes 0, ..., n_bins - 1
-                # so with exactly n_bins bins
-                # the value 0 is therefore membership of that sample for that
-                # feature of the bin 0
-                # which is perfect for our purposes
-                # format is features_quantile x samples
-            if len(self.__X_hist_transposed) <= split_idx or \
-                self.__X_hist_transposed[split_idx].shape[0] != self.num_features or \
-                self.__X_hist_transposed[split_idx].shape[1] != self.X[split_idx].shape[0]:
-                raise ValueError('Fixed width binning must be set before quantile binning')
-
-            self.__X_hist_transposed[split_idx][self.quantile_idcs, :] = X_hist_transposed
-                # we overwrite the quantile features in the X_hist matrix
+                self.__X_hist_transposed[split_idx][self.quantile_idcs, :] = X_hist_transposed_quantile
+                    # we overwrite the quantile features in the X_hist matrix
 
         # create X_hist
         self.X_hist = []
@@ -369,9 +377,15 @@ class FedHistRandomForestClient():
             # splits x features x n_bins - 1
         for split_idx, _ in enumerate(self.X_hist):
             self.split_points[split_idx, self.fixed_width_idcs, :] = \
-                self.__split_points_fixed_width[split_idx]
-            self.split_points[split_idx, self.quantile_idcs, :] = \
-                np.tile(split_points_quantile, len(self.quantile_idcs))
+                self.__split_points_fixed_width[split_idx] # type: ignore
+
+            if len(self.quantile_idcs) > 0:
+                tiles_split_points_quantile = np.tile(split_points_quantile, len(self.quantile_idcs))
+            else:
+                tiles_split_points_quantile = np.zeros((0, self.n_bins - 1))
+                # necessary because tile is a piece of shit that does ignore the first argument if
+                # the number of repeats is 0
+            self.split_points[split_idx, self.quantile_idcs, :] = tiles_split_points_quantile
 
     def get_quantile_binning_aggregation(self) -> List[np.ndarray]:
         """
@@ -382,6 +396,7 @@ class FedHistRandomForestClient():
             The first entry in the last dimension is the array of sample counts,
             the second entry is the array of column-wise sums.
         """
+        self.logging_class.info('Calculating quantile binning aggregation...')
         result = []
         for split_data in self.X:
             split_data = split_data[:, self.quantile_idcs]
@@ -409,13 +424,15 @@ class FedHistRandomForestClient():
             global_counts: List[List[int]] (splits x n_quantile_features):
                 The global sample count for each feature.
         """
+        self.logging_class.info('Calculating local stddev...')
         self.global_means = [np.array(d) for d in global_means]
         self.global_counts = [np.array(d) for d in global_counts]
             # MISSING_VALUES_SUPPORT: in this case the sample counts might differ and the following
             # check is not valid
         # ensure all global_counts are the same value per split
         for split_global_counts in self.global_counts:
-            if not np.all(split_global_counts == split_global_counts[0]):
+
+            if len(split_global_counts) > 0 and not np.all(split_global_counts == split_global_counts[0]):
                 raise ValueError('Global counts differ between features')
         stddevs = []
             # format is splits x num_features_quantile
@@ -518,13 +535,13 @@ class FedHistRandomForestClient():
 
         if self.prediction_mode not in ['classification', 'regression']:
             raise AttributeError('Only classification and regression are valid modes.')
-        if not self.RF_feat_idcs:
+        if self.RF_feat_idcs is None:
             raise AttributeError('Feature indices must be set before initializing the forest.')
-        if not self.X_hist or not self.split_points:
+        if self.X_hist is None or self.split_points is None:
             raise AttributeError('Binning information must be set before initializing the forest.')
-        if not self.global_means or not self.global_stddevs or not self.global_counts:
+        if self.global_means is None or self.global_stddevs is None or self.global_counts is None:
             raise AttributeError('Global statistics must be set before initializing the forest.')
-        if not self.global_classes:
+        if self.global_classes is None:
             raise AttributeError('Global classes must be set before initializing the forest.')
 
 
@@ -572,9 +589,10 @@ class FedHistRandomForestClient():
                 contains this target class. Otherwise, it is None.
                 The whole array of nodes might be None if the tree is finished.
         """
-        if not self.rf_models:
+        self.logging_class.info('Calculating split scores...')
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet')
-        if not self.X_hist:
+        if self.X_hist is None:
             raise ValueError('Binning information must be set before calculating split scores')
         scores = []
         counts = []
@@ -612,13 +630,14 @@ class FedHistRandomForestClient():
             sets them as the new current_depth_nodes
             Also checks if the tree is finished and sets the tree.finished attribute
         """
-        if not self.rf_models:
+        self.logging_class.info('Setting current depth nodes...')
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet')
-        if not self.X_hist or not self.split_points:
+        if self.X_hist is None or self.split_points is None:
             raise ValueError('Binning information must be set before setting nodes')
-        if not self.global_classes:
+        if self.global_classes is None:
             raise ValueError('Global classes must be set before setting nodes')
-        if not self.global_means or not self.global_stddevs or not self.global_counts:
+        if self.global_means is None or self.global_stddevs is None or self.global_counts is None:
             raise ValueError('Global statistics must be set before setting nodes')
         for split_idx, rf_model in enumerate(self.rf_models):
             rf_model.set_currently_unset_nodes(global_best_split[split_idx], global_leaf_info[split_idx])
@@ -631,7 +650,7 @@ class FedHistRandomForestClient():
         Returns:
             bool: True if all models are finished, False otherwise
         """
-        if not self.rf_models:
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet. Cannot check if its done')
         for rf_model in self.rf_models:
             finished = rf_model.check_finished()
@@ -649,7 +668,7 @@ class FedHistRandomForestClient():
                 samples per class in the leaf node. Per node, the list indexes are the same
                 then the class indexes.
         """
-        if not self.check_finished() or not self.rf_models:
+        if not self.check_finished() or self.rf_models is None:
             raise ValueError("Trying to set leaf node values before finishing the tree")
         leaf_samples: List[List[List[List[int]]]] = []
         for model in self.rf_models:
@@ -664,7 +683,7 @@ class FedHistRandomForestClient():
             global_leaf_samples: List[List[List[int]]] (splits x n_estimators x num_leaf_nodes):
                 The class_idx for each leaf node in each tree in each split
         """
-        if not self.rf_models:
+        if self.rf_models is None:
             raise ValueError('The forest has not been trained yet')
         for split_idx, rf_model in enumerate(self.rf_models):
             if not rf_model.check_finished():
@@ -680,7 +699,7 @@ class FedHistRandomForestClient():
         (split x n_estimators): The oob error rate for each estimator in each split.
         Per tree, the tuple contains the number of incorrect predictions and the number of oob samples.
         """
-        if not self.rf_models:
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet')
         if not self.check_finished():
             raise ValueError('The forest is not finished yet, cannot calculate oob')
@@ -714,13 +733,13 @@ class FedHistRandomForestClient():
                 mcc: The Matthews correlation coefficient of the model.
                 counts: List[int]: The sample counts per split.
         """
-        if not self.rf_models:
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet')
         if not self.check_finished():
             raise ValueError('The forest is not finished yet, cannot predict yet')
-        if not self.global_classes:
+        if self.global_classes is None:
             raise ValueError('Global classes must be set before evaluating')
-        if not self.global_means or not self.global_stddevs or not self.global_counts:
+        if self.global_means is None or self.global_stddevs is None or self.global_counts is None:
             raise ValueError('Global statistics must be set before evaluating')
         X_test = self.X_test
         y_test = self.y_test
@@ -755,7 +774,7 @@ class FedHistRandomForestClient():
         """
         # save the model if wanted
         basepath = self.outputfolder
-        if not self.rf_models:
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet, but trying to save the model')
         if 'model' in self.output_mode:
             modelpath = f'{basepath}/model.pkl'
@@ -848,6 +867,7 @@ class FedHistRandomForestClient():
             for n_bins n_bins + 1 split points exist, we only need n_bins - 1
             as we don't need the min and max split points (basically open intervals)
         """
+        self.logging_class.info('Calculating global fixed width binning splitpoints...')
         splitpoints_fixed_witdh = []
             # split x feature x n_bins - 1
             # for n_bins n_bins + 1 split points exist, we only need n_bins - 1
@@ -887,7 +907,7 @@ class FedHistRandomForestClient():
         calculates the global mean and the global sample count.
 
         Args:
-            data: List[np.ndarray] (clients x splits x num_features x 2):
+            data: List[np.ndarray] (clients x splits x num_quantile_features x 2):
                 The first entry in the last dimension is the array of column wise sample counts,
                 the second entry is the array of column-wise sums.
 
@@ -898,6 +918,7 @@ class FedHistRandomForestClient():
                 sample_counts: List[np.ndarray] (splits x n_quantile_features):
                     The global sample count for each feature.
         """
+        self.logging_class.info('Calculating global mean and count...')
         means = []
             # splits x features, each entry being the mean for the corresponding feature
             # globally
@@ -917,7 +938,7 @@ class FedHistRandomForestClient():
                 # we sum over the clients axis, new format is num_features x 2
             accumulated_sample_count = global_matrix[:, 0] # vector of shape n_quantile_features
             accumulated_sum = global_matrix[:, 1] # vector of shape n_quantile_features
-            mean = accumulated_sum / accumulated_sample_count # vector of shape n_quantile_features
+            mean = accumulated_sum / accumulated_sample_count # vector of length n_quantile_features
             means.append(mean)
             sample_counts.append(accumulated_sample_count)
         self.global_means = means
@@ -1027,9 +1048,12 @@ class FedHistRandomForestClient():
         Returns:
             np.ndarray (n_estimators x max_features): The feature indices.
         """
-        RF_feat_idcs = np.random.choice(self.n_features,
-                                        size=(self.n_estimators, self.max_features),
-                                        replace=False)
+        RF_feat_idcs = []
+        for _ in range(self.n_estimators):
+            RF_feat_idcs.append(np.random.choice(self.n_features,
+                                                 size=self.max_features,
+                                                 replace=False))
+        RF_feat_idcs = np.array(RF_feat_idcs)
         self.RF_feat_idcs = RF_feat_idcs
         return RF_feat_idcs
 
@@ -1067,9 +1091,9 @@ class FedHistRandomForestClient():
                 Contains the indexes in current_depth_nodes that have been determined to be
                 leaf nodes.
         """
-        if not self.rf_models:
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet')
-        if not self.X_hist:
+        if self.X_hist is None:
             raise ValueError('Binning information must be set before calculating split scores')
 
         global_split_scores = []
@@ -1227,7 +1251,7 @@ class FedHistRandomForestClient():
         Returns:
             None, updates the weights in the RF_models.
         """
-        if not self.rf_models:
+        if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet')
         if len(weights) != len(self.rf_models):
             raise ValueError('The number of splits differ between the weights and the models')

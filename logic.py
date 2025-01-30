@@ -76,6 +76,8 @@ def main(protocol_fed_learning: ProtocolFedLearning,
             # n_estimators x max_features
             # for each tree in the random forest the feature indices
             # are randomly choosen
+        print(f"Broadcastin the following")
+        print(f"{[RF_feat_idcs, client.get_available_classes(), client.get_class_weights()]}")
         protocol_fed_learning.broadcast_data([RF_feat_idcs, client.get_available_classes(), client.get_class_weights()])
 
     RF_feat_idcs, classes, weights = tuple(protocol_fed_learning.await_data())

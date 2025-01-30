@@ -16,9 +16,10 @@ class SharedDictionary:
     A helper class that allows multiple instances to share a single dictionary concurrently.
     """
 
-    def __init__(self):
+    def __init__(self, num_clients: int):
         self._shared_dict = {}
         self._lock = Lock()
+        self.num_clients = num_clients
 
     def get(self, key):
         """
@@ -27,12 +28,51 @@ class SharedDictionary:
         with self._lock:
             return self._shared_dict.get(key)
 
-    def get_all_values(self):
+    def get_all_non_global_values(self):
         """
         Gets all key-value pairs from the shared dictionary.
         """
         with self._lock:
-            return list(self._shared_dict.values())
+            result = []
+            for key, value in self._shared_dict.items():
+                if key not in ['global', 'times_accesed_global']:
+                    result.append(value)
+            return result
+
+    def delete_all_but_global(self):
+        """
+        Deletes all key-value pairs from the shared dictionary except the one with key 'global'.
+        """
+        with self._lock:
+            if 'global' in self._shared_dict and 'times_accesed_global' in self._shared_dict:
+                self._shared_dict = {'global': self._shared_dict['global'],
+                                     'times_accesed_global': self._shared_dict['times_accesed_global']}
+            else:
+                self._shared_dict = {}
+
+    def increment_times_accesed_global(self):
+        """
+        Increments the value associated with the key 'times_accesed_global' in the shared dictionary.
+        """
+        with self._lock:
+            if 'times_accesed_global' in self._shared_dict:
+                self._shared_dict['times_accesed_global'] += 1
+            else:
+                raise ValueError("The key 'times_accesed_global' does not exist in the shared dictionary, but trying to increment it")
+            # cleanup 'global' if all clients have accessed it
+            if self._shared_dict['times_accesed_global'] == self.num_clients:
+                # remove the global data
+                del self._shared_dict['global']
+                del self._shared_dict['times_accesed_global']
+
+    def update_global(self, data):
+        """
+        Updates the value associated with the key 'global' in the shared dictionary.
+        """
+        with self._lock:
+            self._shared_dict['global'] = data
+            self._shared_dict['times_accesed_global'] = 0
+                # reset as this new data has not been accessed by any client yet
 
     def set(self, key, value):
         """
@@ -84,6 +124,7 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
         self.inputfolder = inputfolder
         self.outputfolder = outputfolder
         self.shared_dict = shared_dict
+        self.previously_awaited_data = None
 
     @property
     def is_coordinator(self):
@@ -95,7 +136,16 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
                                  use_smpc=False,
                                  use_dp=False,
                                  memo=None):
-        self.shared_dict.set(self.client_id, data)
+        print(f"Client {self.client_id} sending data to coordinator")
+        print(f"Data: {type(data)}")
+        while True:
+            # we can only send if what we send before was gather already
+            # the gathering deletes the data from the shared dictionary
+            # we therefore only need to make sure that get returns None
+            if self.shared_dict.get(self.client_id) is None:
+                self.shared_dict.set(self.client_id, data)
+                break
+            time.sleep(5)
 
     def gather_data(self,
                     is_json: bool=False,
@@ -106,8 +156,12 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
             raise ValueError("Only the coordinator can gather data")
         # wait for enough data to arrive in a loop
         while True:
-            data_packets = self.shared_dict.get_all_values()
+            data_packets = self.shared_dict.get_all_non_global_values()
+            print(f"gathering data, got {len(data_packets)} of {self.num_clients} data packets")
+            print(f"Data packets: {type(data_packets)}")
             if len(data_packets) == self.num_clients:
+                # reset the shared dictionary
+                self.shared_dict.delete_all_but_global()
                 return data_packets
             time.sleep(5)
 
@@ -118,7 +172,14 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
                        memo: Optional[Any] = None) -> None:
         if not self.coordinator:
             raise ValueError("Only the coordinator can broadcast data")
-        self.shared_dict.set('global', data)
+        print(f"Broadcasting data to all clients")
+        while True:
+            if not self.shared_dict.get('times_accesed_global'):
+                # only happens after all clients have accessed the global data
+                # or at the start when no client has accessed the global data
+                self.shared_dict.update_global(data)
+                break
+            time.sleep(5)
 
     def await_data(self,
                      n: int = 1,
@@ -132,8 +193,18 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
             raise ValueError("This method only supports n=1 right now")
         while True:
             data = self.shared_dict.get('global')
-            if not data:
-                time.sleep(5)
+
+            if data is not None and data != self.previously_awaited_data:
+                # data is not None -> some data was broadcasted
+                # data != self.previously_awaited_data -> if this is true other clients have not yet
+                # accessed the data. We need to wait until all clients have accessed the data
+                print(f"Client {self.client_id} received data, incrementing times_accesed_global")
+                print(f"Data: {type(data)}")
+                self.shared_dict.increment_times_accesed_global()
+                self.previously_awaited_data = data
+                break
+            time.sleep(5)
+
         # unwrap is not needed as we never wrap the data in the first place
         return data
 
@@ -164,7 +235,7 @@ class LocalFedLearningSimulationWrapper:
             raise ValueError("The number of client folders and output folders must be the same")
         # basic variables
         self.num_clients = len(clientfolders)
-        self.shared_dict = SharedDictionary()
+        self.shared_dict = SharedDictionary(num_clients=self.num_clients)
 
         # copy files from the generic folder to each client folder
         for clientfolder in clientfolders:

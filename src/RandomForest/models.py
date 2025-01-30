@@ -128,7 +128,7 @@ class RandomForest:
             global_classes in the leaf node. The index of the returned list corresponds to the index
             of the global classes.
         """
-        if not self.__y:
+        if self.__y is None:
             raise ValueError('No y data to calculate the leaf node samples.')
         tree_leaves = []
         for estimator in self.__decision_trees:
@@ -161,7 +161,7 @@ class RandomForest:
         """
         if not self.__oob:
             raise ValueError('OOB error is not used but the oob calculation is called')
-        if not self.__X_hist or not self.__y:
+        if self.__X_hist is None or self.__y is None:
             raise ValueError('No data to calculate the oob error.')
         oob_errors = []
         for tree in self.__decision_trees:
@@ -274,7 +274,7 @@ class RandomForest:
         scores = []
         counts = []
         only_class = []
-        if not self.__X_hist or not self.__y:
+        if self.__X_hist is None or self.__y is None:
             raise ValueError('No data to calculate the split scores. Is the model finished?')
         for tree in self.__decision_trees:
             if tree.finished:
@@ -310,7 +310,7 @@ class RandomForest:
             global_leaf_info: 2d list of dimensions (n_estimators, num_leaf_nodes),
                 Contains for each estimator the indexes of the leaf nodes.
         """
-        if not self.__X_hist or not self.__y or not self.__split_points:
+        if self.__X_hist is None or self.__y is None or not self.__split_points:
             raise ValueError('No data to set the nodes. Is the model finished?')
         for tree_idx, tree in enumerate(self.__decision_trees):
             if global_best_split[tree_idx] is None or global_leaf_info[tree_idx] is None:
@@ -571,7 +571,7 @@ class DecisionTree:
         # 1. get the oob samples
         # 2. predict the oob samples
         # 3. return the amount of incorrect samples and the total oob samples
-        if not self.root.__sample_idcs:
+        if self.root.__sample_idcs is None:
             raise ValueError('No sample indices for this trees root.')
         oob_samples = np.setdiff1d(np.arange(len(X_hist)), self.root.__sample_idcs)
         predicted_values = self.predict_hist(X_hist[oob_samples])
@@ -580,7 +580,7 @@ class DecisionTree:
 
 
 
-    def _check_leaf_node_consistency(self, node):
+    def _check_leaf_node_consistency(self, node: "Node"):
         """
         Recursive function that finds all nodes without children and checks that they are leaf nodes.
 
@@ -591,7 +591,7 @@ class DecisionTree:
             if node.left or node.right:
                 raise ValueError('Leaf node has children.')
             return # leaf node with no children, all good
-        if not node.left or not node.right:
+        if node.left is None or node.right is None:
             raise ValueError('Non-leaf node without children.')
         self._check_leaf_node_consistency(node.left)
         self._check_leaf_node_consistency(node.right)
@@ -608,7 +608,7 @@ class DecisionTree:
             raise ValueError("Function must be called with only a singular raw")
         if node.is_leaf_node():
             return node.value
-        if not node.feature_idx or not node.threshold or not node.left or not node.right or not node.bin_idx:
+        if node.feature_idx is None or node.threshold is None or node.left is None or node.right is None or not node.bin_idx:
             raise ValueError('Node is not set correctly')
         if x_hist[node.feature_idx] <= node.bin_idx:
             return self._traverse_tree_predict_hist(x_hist, node.left)
@@ -625,7 +625,7 @@ class DecisionTree:
             raise ValueError("Function must be called with only a singular raw")
         if node.is_leaf_node():
             return node.value
-        if not node.feature_idx or not node.threshold or not node.left or not node.right:
+        if node.feature_idx is None or node.threshold is None or node.left is None or node.right is None:
             raise ValueError('Node is not set correctly')
         if x[node.feature_idx] <= node.threshold:
             return self._traverse_tree_predict(x, node.left)
@@ -653,7 +653,7 @@ class DecisionTree:
         """
         yield node
         if node.is_leaf_node():
-            if not node.left or not node.right:
+            if node.left is None or node.right is None:
                 raise ValueError("A leaf node has children")
             yield self._traverse_tree_dfs_helper(node.left)
             yield self._traverse_tree_dfs_helper(node.right)
@@ -849,7 +849,7 @@ class Node:
         # ensure input data formatting
         if len(X_hist.shape) != 2:
             raise ValueError('X_hist must be a 2d array.')
-        if X_hist.shape[1] != len(y):
+        if X_hist.shape[0] != len(y):
             raise ValueError('X_hist and y must have the same number of samples.')
         if len(y.shape) != 1:
             raise ValueError('y must be a 1d array.')
@@ -944,14 +944,23 @@ class Node:
         """
         if len(left_y.shape) != 1 or len(right_y.shape) != 1:
             raise ValueError('y must be a 1d array.')
-        left_weights = np.ones((len(left_y))) if self.class_weights is None else np.vectorize(self.class_weights.get)(left_y)
+
+        left_weights = np.ndarray((0))
+        total_left = 0
+        if len(left_y) > 0:
+            # vectorize fails on empty arrays, so we need this if
+            left_weights = np.ones((len(left_y))) if self.class_weights is None else np.vectorize(self.class_weights.get)(left_y)
             # either just one for any sample or the weight of the sample by their class
             # np.vectorize(self.class_weights.get)(left_y) runs weights.get on each element
             # of left_y constructing an np.array. we therefore get an np.array of length samples
             # with the weight for each sample as values.
-        right_weights = np.ones((len(right_y))) if self.class_weights is None else np.vectorize(self.class_weights.get)(right_y)
-        total_left = np.sum(left_weights)
-        total_right = np.sum(right_weights)
+            total_left = np.sum(left_weights)
+        right_weights = np.ndarray((0))
+        total_right = 0
+        if len(right_y) > 0:
+            right_weights = np.ones((len(right_y))) if self.class_weights is None else np.vectorize(self.class_weights.get)(right_y)
+            total_right = np.sum(right_weights)
+
         total_y = total_left + total_right
 
         gini_left = 1.0 - np.sum((np.bincount(left_y.astype('int'), minlength=self._num_classes, weights=left_weights) / total_left) ** 2)
