@@ -15,6 +15,7 @@ import bios
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+from sklearn.metrics import matthews_corrcoef, accuracy_score
 
 from src.helper.util import validate_input_data, convert_to_np
 from src.RandomForest.models import RandomForest
@@ -172,7 +173,7 @@ class FedHistRandomForestClient():
 
         # variables that are set by methods later on
         self.__split_points_fixed_width: Optional[np.ndarray] = None
-            # splits x feature x n_bins - 1
+            # splits x fixed_width_feature x n_bins - 1
         self.split_points: Optional[np.ndarray] = None
             # splits x n_features x n_bins - 1
         self.global_means: Optional[List[np.ndarray]] = None
@@ -203,7 +204,7 @@ class FedHistRandomForestClient():
         of the data.
 
         Returns:
-            List[np.ndarray] (splits x 2 x n_features): The binning bounds.
+            List[np.ndarray] (splits x 2 x n_fixed_width_features): The binning bounds.
                 First entry in the second dimension is the array of lower bounds,
                 second entry is the array of upper bounds.
         """
@@ -236,7 +237,7 @@ class FedHistRandomForestClient():
         data points to the bins and stores the bin indexes in self.__X_hist_transposed.
         Quantile binning then finalizes and creates self.X_hist.
 
-        Args: global_split_points: List[List[List[float]]] (splits x n_features x n_bins - 1):
+        Args: global_split_points: List[List[List[float]]] (splits x n_features_fixed_width x n_bins - 1):
             The global split points for the fixed width binning. Open interval
             without a min/max value.
 
@@ -244,6 +245,12 @@ class FedHistRandomForestClient():
             None, just sets self.X_hist of the self.fixed_width_idcs
         """
         self.logging_class.info('Setting fixed width bins...')
+        # for feature_idx, split_points in enumerate(global_split_points[0]):
+        #     print(f"Feature {feature_idx}: {split_points}")
+        #     min_in_data = self.X[0][:, feature_idx].min()
+        #     max_in_data = self.X[0][:, feature_idx].max()
+        #     print(f"Min in data: {min_in_data}, max in data: {max_in_data}")
+
         # set the split_points for later
         self.__split_points_fixed_width = np.array(global_split_points)
         if self.__X_hist_transposed is None:
@@ -597,6 +604,7 @@ class FedHistRandomForestClient():
         scores = []
         counts = []
         only_classes = []
+            # per split
         for split_idx, rf_model in enumerate(self.rf_models):
             score, count, only_class = rf_model.get_split_scores()
             scores.append(score)
@@ -668,6 +676,7 @@ class FedHistRandomForestClient():
                 samples per class in the leaf node. Per node, the list indexes are the same
                 then the class indexes.
         """
+        self.logging_class.info('Getting leaf node samples...')
         if not self.check_finished() or self.rf_models is None:
             raise ValueError("Trying to set leaf node values before finishing the tree")
         leaf_samples: List[List[List[List[int]]]] = []
@@ -675,16 +684,17 @@ class FedHistRandomForestClient():
             leaf_samples.append(model.get_leaf_node_samples())
         return leaf_samples
 
-    def set_final_leaf_nodes(self, global_leaf_samples: List[List[List[int]]]) -> None:
+    def set_final_leaf_nodes(self, global_leaf_samples: List[List[np.ndarray]]) -> None:
         """
         Given the global classes predicted by the leaf nodes, sets the leaf nodes
 
         Args:
-            global_leaf_samples: List[List[List[int]]] (splits x n_estimators x num_leaf_nodes):
+            global_leaf_samples: (splits x n_estimators x num_leaf_nodes):
                 The class_idx for each leaf node in each tree in each split
         """
         if self.rf_models is None:
             raise ValueError('The forest has not been trained yet')
+
         for split_idx, rf_model in enumerate(self.rf_models):
             if not rf_model.check_finished():
                 raise ValueError('The model is not finished yet')
@@ -723,8 +733,8 @@ class FedHistRandomForestClient():
         just the model, just the predictions or both.
 
         Args:
-            X_test: np.ndarray (num_splis x num_samples x num_features): The test data.
-            y_test: np.ndarray (num_splits x num_samples): The test labels.
+            X_test: (num_splis x num_samples x num_features): The test data.
+            y_test: (num_splits x num_samples): The test labels.
 
         Returns:
         Tuple[List[np.number], List[np.number], List[int]]
@@ -752,6 +762,11 @@ class FedHistRandomForestClient():
 
             # predict the test data
             predictions = rf_model.predict(X=X_test_split)
+
+            # log the mcc and accuracy
+            acc = accuracy_score(y_test_split, predictions)
+            mcc = matthews_corrcoef(y_test_split, predictions)
+            self.logging_class.info(f'Test Data: Split {split_idx}: Accuracy: {acc}, MCC: {mcc}')
 
             # save the information
             self.write_output(split_idx=split_idx,
@@ -1070,7 +1085,7 @@ class FedHistRandomForestClient():
         Args:
             client_split_scores: List[List[List[List[List[float]]]]]
             (clients x splits x n_estimators x n_nodes x
-                n_features x n_bins):
+                n_features x n_bins-1):
                 The scores of the trees for the current level of all possible splits by bins
             sample_count_per_client: List[List[List[List[List[int]]]]]
                 (clients x splits x n_estimators x n_nodes x n_features):
@@ -1111,6 +1126,7 @@ class FedHistRandomForestClient():
                             for specific_client_split_score in client_split_scores]):
                         raise ValueError(f'Tree {tree_idx} is already finished but clients sent data')
                     tree_scores.append(None)
+                    leaf_status_per_tree.append(None)
                     continue
                 # ensure that all clients sent data for this tree
                 # pylance doesn't understand taht we do this so later we use type: ignore
@@ -1122,7 +1138,7 @@ class FedHistRandomForestClient():
                     raise ValueError(f'Not all clients sent sample counts for the tree {tree_idx}')
                 if not all([specific_client_only_class[split_idx][tree_idx] is not None \
                             for specific_client_only_class in only_class_per_client]):
-                    raise ValueError(f'Not all clients sent only class info for the tree {tree_idx}')
+                    raise ValueError(f'Not all clients sent only class info for the tree {tree_idx}. Some clients consider the tree done, others dont')
                 for node_idx, _ in enumerate(tree.iterate_cur_depth_nodes()):
                     split_scores = [d[split_idx][tree_idx][node_idx] for d in client_split_scores] #type: ignore
                         # clients x features x n_bins
@@ -1131,22 +1147,29 @@ class FedHistRandomForestClient():
                     total_counts = np.sum(sample_counts, axis=0)
                         # vector of length features of the total number of samples over all clients
                         # per feature of this specific node
+
                     ratios = np.divide(sample_counts, total_counts)
                         # this is the weight to use for the relevant client
                         # dividing clients x features by features -> ratio for each client and feature
                         # (clients x features dimensions)
                     # sum up the split scores considering the weights
-                    sum_split_score = np.sum([split_scores[client_idx] * ratios[client_idx] for client_idx in range(len(split_scores))], axis=0)
+                    sum_split_score = np.sum([split_scores[client_idx] * ratios[client_idx][:, np.newaxis] for client_idx in range(len(split_scores))], axis=0)
                         # we multiply the split scores with the ratios of the relevant client
                         # then we can sum over the clients axis
                         # this results in the end in a features x n_bins matrix
-                    assert sum_split_score.shape == (self.n_features, self.n_bins)
+                    if sum_split_score.shape != (self.max_features, self.n_bins-1):
+                        self.logging_class.error(f"Split scores of all clients for this node: {split_scores}")
+                        self.logging_class.error(f"Split scores sum: {sum_split_score}")
+                        self.logging_class.error(f'Split score shape is {sum_split_score.shape} but should be {(self.max_features, self.n_bins)}')
+                        raise ValueError('Split score shape is not correct')
                     feature_idx, bin_idx = np.unravel_index(np.argmin(sum_split_score), sum_split_score.shape)
                         # we find the feature and bin index with the lowest score over all features and bins
                         # np.argmin returns the index of the flattened array, we need to unravel it
                         # back to the original (sum_split_score.shape) shape
                     min_score = np.min(sum_split_score)
                     node_scores.append((feature_idx, bin_idx, min_score))
+
+                    ## leaf node checks
                     # now we need to decide whether this node is a leaf node
                     # only one class
                     only_classes = [d[split_idx][tree_idx][node_idx] for d in only_class_per_client] #type: ignore
@@ -1159,12 +1182,13 @@ class FedHistRandomForestClient():
                     # max_depth reached
                     # get the node
                     node = tree.get_cur_depth_node(node_idx)
-                    if node.depth >= self.rf_models[split_idx].__max_depth - 1:
-                        # max_depth is 1 indexed, depth is 0 indexed
+                    if node.depth >= self.rf_models[split_idx].get_max_depth() - 1:
+                        # max_depth is a count, depth is an index
+                        # -> count - 1 = index
                         leaf_status_per_node.append(node_idx)
                         continue
                     # min_samples_split reached
-                    if total_counts[feature_idx] < self.rf_models[split_idx].__min_samples_split:
+                    if total_counts[feature_idx] < self.rf_models[split_idx].get_min_samples_split():
                         leaf_status_per_node.append(node_idx)
                         continue
                     # min_samples_leaf reached
@@ -1182,6 +1206,7 @@ class FedHistRandomForestClient():
                         if parent_score - min_score < self.rf_models[split_idx].min_impurity_decrease:
                             leaf_status_per_node.append(node_idx)
                             continue
+
                 tree_scores.append(node_scores)
                 leaf_status_per_tree.append(leaf_status_per_node)
             global_split_scores.append(tree_scores)
@@ -1191,27 +1216,44 @@ class FedHistRandomForestClient():
 
     def coord_aggregate_leaf_samples(self,
                                      gathered_leaf_samples: List[List[List[List[List[int]]]]]) \
-                                    -> List[List[List[int]]]:
+                                    -> List[List[np.ndarray]]:
         """
         Finds for all leave nodes of the global model which global_class the leaf corresponds to.
 
         Args:
-            gathered_leaf_samples: List[List[List[Dict[int, int]]]] (clients x splits x trees x
-                leaf_nodes): Per leaf node, the amount of samples per class as a
-                Dict[class] = frequency.
+            gathered_leaf_samples: List[List[List[List[List[int]]]]]
+                (clients x splits x trees x leaf_nodes x frequency (index is class_idx)):
 
         Returns:
             List[List[List[int]]] (splits x trees x leaf_nodes): per leaf node the class_idx which
             globally has the highest frequency
         """
-        gathered_leaf_samples_np = np.array(gathered_leaf_samples)
-        # we need to collapse the clients axis
-        gathered_leaf_samples_np = np.sum(gathered_leaf_samples_np, axis=0)
-        # now we can find the class with the highest frequency
-        # we need to get the index of the last dimension with the highest value in that dimension
-        # this is the class index
-        leaf_classes = np.argmax(gathered_leaf_samples_np, axis=-1)
-        return leaf_classes
+        assert self.rf_models is not None, 'The forest has not been initialized yet'
+        assert self.global_classes is not None, 'Global classes must be set before aggregating'
+        assert self.X_hist is not None, 'Binning information must be set before aggregating'
+        self.logging_class.info('Aggregating leaf samples...')
+
+        # aggregate the client information
+        aggregated_leaves = [] # dimensions are splits x trees x leaf_nodes, value is the class_idx
+        for split_idx, _ in enumerate(self.X_hist):
+            aggregated_leaves_split_tree = [] # trees x leaf_nodes
+            for tree_idx in range(len(gathered_leaf_samples[0][split_idx])):
+                try:
+                    leaf_samples = np.array([d[split_idx][tree_idx] for d in gathered_leaf_samples])
+                except Exception as e:
+                    raise ValueError('The different clients seem to assume different nodes as leaves') from e
+                # colapse the clients axis
+                leaf_samples = np.sum(leaf_samples, axis=0)
+                    # shape is leaf_nodes x class_idx
+                    # as we have frequencies, we do NOT need to weight the clients, this is done
+                    # by the frequencies
+                aggregated_leaves_split_tree.append(np.argmax(leaf_samples, axis=-1))
+                    # index of the class with the highest frequency
+                    # index in the last list is also the class idx
+                    # how convenient
+            aggregated_leaves.append(aggregated_leaves_split_tree)
+
+        return aggregated_leaves
 
     def coord_aggregate_oob(self, gathered_oob_errors: List[List[List[Tuple[int, int]]]]) -> \
             List[List[float]]:

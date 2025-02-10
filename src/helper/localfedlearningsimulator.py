@@ -11,6 +11,8 @@ import shutil
 from typing import Any, Optional, List
 from .protocolfedlearningclass import ProtocolFedLearning
 
+WAITING_TIME = 0.3
+
 class SharedDictionary:
     """
     A helper class that allows multiple instances to share a single dictionary concurrently.
@@ -137,7 +139,6 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
                                  use_dp=False,
                                  memo=None):
         print(f"Client {self.client_id} sending data to coordinator")
-        print(f"Data: {type(data)}")
         while True:
             # we can only send if what we send before was gather already
             # the gathering deletes the data from the shared dictionary
@@ -145,7 +146,7 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
             if self.shared_dict.get(self.client_id) is None:
                 self.shared_dict.set(self.client_id, data)
                 break
-            time.sleep(5)
+            time.sleep(WAITING_TIME)
 
     def gather_data(self,
                     is_json: bool=False,
@@ -158,12 +159,11 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
         while True:
             data_packets = self.shared_dict.get_all_non_global_values()
             print(f"gathering data, got {len(data_packets)} of {self.num_clients} data packets")
-            print(f"Data packets: {type(data_packets)}")
             if len(data_packets) == self.num_clients:
                 # reset the shared dictionary
                 self.shared_dict.delete_all_but_global()
                 return data_packets
-            time.sleep(5)
+            time.sleep(WAITING_TIME)
 
     def broadcast_data(self,
                        data: Any,
@@ -179,7 +179,7 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
                 # or at the start when no client has accessed the global data
                 self.shared_dict.update_global(data)
                 break
-            time.sleep(5)
+            time.sleep(WAITING_TIME)
 
     def await_data(self,
                      n: int = 1,
@@ -199,11 +199,10 @@ class LocalFedLearningSimulator(ProtocolFedLearning):
                 # data != self.previously_awaited_data -> if this is true other clients have not yet
                 # accessed the data. We need to wait until all clients have accessed the data
                 print(f"Client {self.client_id} received data, incrementing times_accesed_global")
-                print(f"Data: {type(data)}")
                 self.shared_dict.increment_times_accesed_global()
                 self.previously_awaited_data = data
                 break
-            time.sleep(5)
+            time.sleep(WAITING_TIME)
 
         # unwrap is not needed as we never wrap the data in the first place
         return data

@@ -1,4 +1,4 @@
-from typing import Optional, Union, Dict, Any, List, Iterator, Tuple
+from typing import Optional, Union, Dict, Any, List, Iterator, Tuple, Generator
 
 import numpy as np
 import joblib
@@ -113,6 +113,19 @@ class RandomForest:
                                 class_weights=self.__class_weights)
             self.__decision_trees.append(tree)
 
+    def get_max_depth(self) -> int:
+        """
+        Returns the maximum allowed depth of the trees in the forest.
+        """
+        return self.__max_depth
+
+    def get_min_samples_split(self) -> int:
+        """
+        Returns the minimum number of samples required for a node to be considered for splitting.
+        If a node has fewer samples than this, it will be a leaf node.
+        """
+        return self.__min_samples_split
+
     def __bootstrap_samples(self, n_patients_local: int) -> np.ndarray:
         sample_size = max(round(n_patients_local * self.__max_samples), 1)
         sample_idcs = np.random.choice(n_patients_local, sample_size, replace=self.__bootstrap)
@@ -135,20 +148,24 @@ class RandomForest:
             tree_leaves.append(estimator.get_leaf_node_samples(y=self.__y))
         return tree_leaves
 
-    def set_final_leaf_nodes(self, global_leaf_samples: List[List[int]]):
+    def set_final_leaf_nodes(self, global_leaf_samples: List[np.ndarray]) -> None:
         """
         Given the global classes predicted by the leaf nodes, sets the leaf nodes
 
         Args:
-            global_leaf_samples: List[List[int]] (n_estimators x num_leaf_nodes):
+            global_leaf_samples: List[np.ndarray] (n_estimators x num_leaf_nodes):
                 The class_idx for each leaf node in each tree in each split
         """
         if len(global_leaf_samples) != len(self.__decision_trees):
             raise ValueError('Number of trees does not match the number of global leaf trees.')
         for tree_idx, tree_data in enumerate(global_leaf_samples):
             tree = self.__decision_trees[tree_idx]
+            counter = 0
             for leaf_node, leaf_class_idx in zip(tree._traverse_tree_dfs_leaves(), tree_data):
                 leaf_node.value = self.__global_classes[leaf_class_idx]
+                counter += 1
+            assert counter == len(tree_data), 'Got a different number of leaf nodes than expected: ' + \
+                f'tree iteration {counter} vs got these globally {len(tree_data)}'
 
 
     def calc_oob(self) -> List[Tuple[int, int]]:
@@ -197,20 +214,23 @@ class RandomForest:
         # we switch the axes to have the samples as the first axis
         predicted_values = np.swapaxes(predicted_values, axis1=0, axis2=1)
             # n_samples x n_estimators
-        weights = np.array([tree.__weight for tree in self.__decision_trees])
+        weights = np.array([tree.get_weight() for tree in self.__decision_trees])
 
         # apply the weights and make the final prediction
         sum_predicted_classes = np.zeros((len(X), len(self.__global_classes)))
             # n_samples x n_classes, for each sample the sum of the predicted classes
-        for class_idx, cl in self.__global_classes:
+        for class_idx, cl in enumerate(self.__global_classes):
             sum_predicted_classes[:, class_idx] = np.sum((predicted_values == cl) * weights, axis=1)
                 # for each class, sum the weights of the trees * if the corresponding class is
-                # predicted by the tree
+                # predicted by the treex
                 # this works because the True is seen as 1 and the False as 0
-        predicted_values = np.argmax(sum_predicted_classes, axis=1)
+        predicted_values:np.ndarray = np.argmax(sum_predicted_classes, axis=1)
             # we go from n_samples x n_classes to n_samples by taking the index of the highest value
         # now we translate from class_idx to the actual class
-        predicted_values = predicted_values.map(lambda x: self.__global_classes[x])
+        print(f"Global classes: {self.__global_classes}") #TODO: rmv
+        print("predicted values as idx: ", predicted_values) #TODO: rmv
+        predicted_values = np.vectorize(lambda x: self.__global_classes[x])(predicted_values)
+        print("predicted values as class: ", predicted_values) #TODO: rmv
         return predicted_values
 
 
@@ -273,14 +293,15 @@ class RandomForest:
         """
         scores = []
         counts = []
-        only_class = []
+        only_classes = []
+            # per tree
         if self.__X_hist is None or self.__y is None:
             raise ValueError('No data to calculate the split scores. Is the model finished?')
         for tree in self.__decision_trees:
             if tree.finished:
                 scores.append(None)
                 counts.append(None)
-                only_class.append(None)
+                only_classes.append(None)
             else:
                 tree_scores, tree_counts, tree_only_class = tree.get_split_scores(
                     X_hist=self.__X_hist,
@@ -288,8 +309,8 @@ class RandomForest:
                     n_bins=self.__num_bins)
                 scores.append(tree_scores)
                 counts.append(tree_counts)
-                only_class.append(tree_only_class)
-        return scores, counts, tree_only_class
+                only_classes.append(tree_only_class)
+        return scores, counts, only_classes
 
     def set_currently_unset_nodes(self,
                                   global_best_split: List[Optional[List[Tuple[int, int, float]]]],
@@ -309,23 +330,34 @@ class RandomForest:
                 the corresponding tree is considered finished and there is no update for this tree.
             global_leaf_info: 2d list of dimensions (n_estimators, num_leaf_nodes),
                 Contains for each estimator the indexes of the leaf nodes.
+                Can be None if the tree is finished.
         """
-        if self.__X_hist is None or self.__y is None or not self.__split_points:
+        if self.__X_hist is None or self.__y is None or self.__split_points is None:
             raise ValueError('No data to set the nodes. Is the model finished?')
         for tree_idx, tree in enumerate(self.__decision_trees):
+            # TODO: rmv
+            # print(f"Setting tree {tree_idx}")
+            # print(f"Global best split: {global_best_split[tree_idx]}")
+            # print(f"Global leaf info: {global_leaf_info[tree_idx]}")
+            # print(f"shape global best split: {np.array(global_best_split).shape}")
+            # print(f"shape global leaf info: {np.array(global_leaf_info).shape}")
             if global_best_split[tree_idx] is None or global_leaf_info[tree_idx] is None:
                 if not tree.finished:
                     raise ValueError('Global model assumes finished tree, local model does not.')
                 continue
 
-            relevant_leaf_idxs = set([global_leaf_info[tree_idx]])
+            relevant_leaf_idxs = set(global_leaf_info[tree_idx]) #type: ignore
+                # type ignore as this is handled by the if above
             next_depth_nodes = []
             for node_idx, node in enumerate(tree.iterate_cur_depth_nodes()):
                 if node.is_leaf_node():
                     raise ValueError('Leaf nodes should not be in the current depth nodes when setting this nodes.')
                 # set node to leaf if necessary
                 if node_idx in relevant_leaf_idxs:
-                    # done with this node
+                    # we need to set the node to a leaf node
+                    # when the model is finished the actual predicted value by the leaf node
+                    # is set using the set_final_leaf_nodes method
+                    node.set_as_leaf_node()
                     continue
                 # update the node and create the children correctly
                 if node_idx >= len(global_best_split[tree_idx]): #type: ignore
@@ -365,10 +397,6 @@ class RandomForest:
             if not tree.finished:
                 return False
         # cleanup
-        self.__X_hist = None
-        self.__y = None
-        self.__class_weights = None
-        self.__split_points = None
         self.finished = True
         return True
 
@@ -443,6 +471,12 @@ class DecisionTree:
 
         self.__cur_depth_nodes = [self.root]
 
+    def get_weight(self) -> float:
+        """
+        Returns the weight of this tree.
+        """
+        return self.__weight
+
     def predict(self,
                 X):
         """
@@ -485,12 +519,13 @@ class DecisionTree:
             containing the score of a split per feature and bin.
             counts: 2d list of dimensions (num_nodes_cur_level, len(self.feat_idcs)), containing
                 the counts of samples for each feature and node
-            only_class: 1d list of length num_nodes_cur_level, containing the class if the node
+            only_classes: 1d list of length num_nodes_cur_level, containing the class if the node
                 has only one class, None otherwise
         """
         scores = []
         counts = []
         only_classes = []
+            # per node
         if len(self.__cur_depth_nodes) == 0 or self.finished:
             # this method should only be called if there are nodes to calculate the split for
             raise ValueError('No nodes to calculate the split for, the tree is finished.')
@@ -501,10 +536,10 @@ class DecisionTree:
             # we later should only add the children of non leaf nodes to
             # current_depth_nodes, this is why if we here then find a set node, we should
             # throw an error
-            node_scores, node_counts, only_class = node.get_split_scores(X_hist, y, n_bins)
+            node_scores, node_counts, node_only_class = node.get_split_scores(X_hist, y, n_bins)
             scores.append(node_scores)
             counts.append(node_counts)
-            only_classes.append(only_class)
+            only_classes.append(node_only_class)
         return scores, counts, only_classes
 
     def get_cur_depth_nodes(self):
@@ -543,7 +578,7 @@ class DecisionTree:
         """
         leaves = []
         for node in self._traverse_tree_dfs_leaves():
-            y_node = y[node.__sample_idcs, :]
+            y_node = y[node.get_sample_idcs()]
             class_frequencies = np.sum(y_node[:, np.newaxis] == self.__global_classes, axis=0)
             # go from y_node 1d array of len num_samples to 2d array of shape (num_samples, 1)
             # then compare each element with the global classes, creating a boolean array
@@ -571,13 +606,13 @@ class DecisionTree:
         # 1. get the oob samples
         # 2. predict the oob samples
         # 3. return the amount of incorrect samples and the total oob samples
-        if self.root.__sample_idcs is None:
+        relevant_samples = self.root.get_sample_idcs()
+        if relevant_samples is None:
             raise ValueError('No sample indices for this trees root.')
-        oob_samples = np.setdiff1d(np.arange(len(X_hist)), self.root.__sample_idcs)
+        oob_samples = np.setdiff1d(np.arange(len(X_hist)), relevant_samples)
         predicted_values = self.predict_hist(X_hist[oob_samples])
         incorrect_samples = np.sum(predicted_values != y[oob_samples])
         return incorrect_samples, len(oob_samples)
-
 
 
     def _check_leaf_node_consistency(self, node: "Node"):
@@ -621,7 +656,7 @@ class DecisionTree:
         Args:
             x: contains one single raw
         """
-        if len(x) != 1:
+        if len(x.shape) != 1:
             raise ValueError("Function must be called with only a singular raw")
         if node.is_leaf_node():
             return node.value
@@ -635,28 +670,22 @@ class DecisionTree:
         """
         Traverse the tree in a depth-first search manner and return only the leaf nodes.
         """
-        for node in self._traverse_tree_dfs():
+        for node in self._traverse_tree_dfs_helper(self.root):
             if node.is_leaf_node():
                 yield node
 
-    def _traverse_tree_dfs(self):
-        """
-        Traverse the tree in a depth-first search manner.
-        """
-        yield from self._traverse_tree_dfs_helper(self.root)
-
-    def _traverse_tree_dfs_helper(self, node: "Node"):
+    def _traverse_tree_dfs_helper(self, node: "Node") -> Generator["Node", None, None]:
         """
         Helper function for the depth_first_search.
         Returns the given node, then the left child, then the right child.
         Recursive
         """
         yield node
-        if node.is_leaf_node():
+        if not node.is_leaf_node():
             if node.left is None or node.right is None:
                 raise ValueError("A leaf node has children")
-            yield self._traverse_tree_dfs_helper(node.left)
-            yield self._traverse_tree_dfs_helper(node.right)
+            yield from self._traverse_tree_dfs_helper(node.left)
+            yield from self._traverse_tree_dfs_helper(node.right)
 
     def _cleanup_tree(self):
         """
@@ -667,7 +696,7 @@ class DecisionTree:
             raise ValueError('Tree is not finished, but trying to clean it')
         self.__cur_depth_nodes = []
         self.__class_weights = None
-        for node in self._traverse_tree_dfs():
+        for node in self._traverse_tree_dfs_helper(self.root):
             node._cleanup_node()
 
 
@@ -770,36 +799,57 @@ class Node:
         relevant_data = X_hist[self.__sample_idcs, feature_idx]
         # create the left and right child nodes
         left_child_idcs, right_child_idcs = self.perform_hist_based_split(relevant_data, bin_idx)
-        child_feature_idcs = np.delete(self.__feature_idcs, feature_idx)
         left_child = Node(depth=self.depth + 1,
                             sample_idcs=left_child_idcs,
                             mode=self.mode,
                             global_classes=self.__global_classes,
                             class_weights=self.class_weights,
-                            feature_idcs=child_feature_idcs,
+                            feature_idcs=self.__feature_idcs,
                             parent=self)
         right_child = Node(depth=self.depth + 1,
                             sample_idcs=right_child_idcs,
                             mode=self.mode,
                             global_classes=self.__global_classes,
                             class_weights=self.class_weights,
-                            feature_idcs=child_feature_idcs,
+                            feature_idcs=self.__feature_idcs,
                             parent=self)
         self.left = left_child
         self.right = right_child
 
         return left_child, right_child
 
-    def set_leaf_node(self, value) -> None:
+    def set_as_leaf_node(self) -> None:
         """
         Set the node as a leaf node.
+        The value can be set later in the set_finally_as_leaf_node function, as setting the value
+        requires the local class frequencies
         """
         self.global_leaf = True
-        self.value = value
         if self.left or self.right:
             raise ValueError('Leaf node has children.')
         if self.feature_idx or self.bin_idx or self.threshold or self.score:
             raise ValueError('Leaf node should not have a split.')
+
+    def get_sample_idcs(self) -> Optional[np.ndarray]:
+        """
+        Simple getter for the sample_idcs asssociated with this node.
+        Basically the sample_idcs that split according to the parents.
+        """
+        return self.__sample_idcs
+
+    def set_finally_as_leaf_node(self, value: Optional[Any]) -> None:
+        """
+        Set the node as a leaf node.
+        The value can be set later, as setting the value requires the local class frequencies in
+        that leaf node. This can be done in each iteration or in the end.
+        """
+        if not self.global_leaf:
+            raise ValueError('Node is not a leaf node, should have been set already using set_as_leaf_node.')
+        if self.left or self.right:
+            raise ValueError('Leaf node has children.')
+        if self.feature_idx or self.bin_idx or self.threshold or self.score:
+            raise ValueError('Leaf node should not have a split.')
+        self.value = value
 
     def _cleanup_node(self):
         """
@@ -831,7 +881,7 @@ class Node:
             n_bins: number of bins to consider for each feature.
 
         Returns:
-            scores: 2d array of shape (len(self.feature_idcs), n_bins), containing the score of a split per
+            scores: 2d array of shape (len(self.feature_idcs), n_bins-1), containing the score of a split per
                 feature and bin.
             counts: list of length len(self.feature_idcs), containing the counts of samples for each feature
             only_class: the class if the node sampleset has only one class, None otherwise
@@ -862,7 +912,9 @@ class Node:
             feature_data = node_data[:, feature_idx]
             scores_per_bin = []
                 # array of length num_bins containing the scores per_bin
-            for bin_idx in range(n_bins):
+            for bin_idx in range(n_bins-1):
+                # since we check for <= bin_idx -> left, for the last bin_idx, left would always
+                # contain all data, so we don't need to check it
                 left_idxs, right_idxs = self.perform_hist_based_split(feature_data, bin_idx)
                 left_y = y[left_idxs]
                 right_y = y[right_idxs]
@@ -962,6 +1014,12 @@ class Node:
             total_right = np.sum(right_weights)
 
         total_y = total_left + total_right
+        if total_left == 0 or total_right == 0:
+            # this means that our 'split' does not split at all
+            # numpy just creates a nan tho
+            # we won't to disencourage such splits, they don't have any information gain
+            # we simply set the gini score to the worst possible score (1)
+            return np.float64(1.0)
 
         gini_left = 1.0 - np.sum((np.bincount(left_y.astype('int'), minlength=self._num_classes, weights=left_weights) / total_left) ** 2)
             # with np.bincount we get an array of length n_classes with the index being the specific
@@ -971,8 +1029,10 @@ class Node:
             # we then divide by the total weight/total number of samples
             # to get the probability of each class
         gini_right = 1.0 - np.sum((np.bincount(right_y.astype('int'), minlength=self._num_classes, weights=right_weights) / total_right) ** 2)
+
         gini = (total_left / total_y) * gini_left + (total_right / total_y) * gini_right
             # we add the two gini impurities weighted by the number of samples/weights by total weight
+
         return gini
 
     def _mse_split_score(self, left_y: np.ndarray, right_y: np.ndarray) -> np.floating:

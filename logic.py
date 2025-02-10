@@ -3,6 +3,8 @@ from typing import List, Optional
 from src.client import FedHistRandomForestClient
 from src.helper.protocolfedlearningclass import ProtocolFedLearning
 
+import numpy as np
+
 def main(protocol_fed_learning: ProtocolFedLearning,
          inputfolder: Optional[str] = None,
          outputfolder: Optional[str] = None):
@@ -76,8 +78,6 @@ def main(protocol_fed_learning: ProtocolFedLearning,
             # n_estimators x max_features
             # for each tree in the random forest the feature indices
             # are randomly choosen
-        print(f"Broadcastin the following")
-        print(f"{[RF_feat_idcs, client.get_available_classes(), client.get_class_weights()]}")
         protocol_fed_learning.broadcast_data([RF_feat_idcs, client.get_available_classes(), client.get_class_weights()])
 
     RF_feat_idcs, classes, weights = tuple(protocol_fed_learning.await_data())
@@ -108,19 +108,24 @@ def main(protocol_fed_learning: ProtocolFedLearning,
                                                 sample_count_per_client=\
                                                     [result[i][1] for i in range(len(result))],
                                                 only_class_per_client=[result[i][2] for i in range(len(result))])
+
             protocol_fed_learning.broadcast_data((global_split_scores, global_leaf_info))
 
         global_split_scores, global_leaf_info = protocol_fed_learning.await_data()
+
         # set nodes/leafs and create new nodes
         client.update_current_depth_nodes(
             global_best_split=global_split_scores,
             global_leaf_info=global_leaf_info
         )
+
         # check if we are done too escape the loop
         # this is done locally, but all clients should finish at the same time
         # as they just used the global data to set the globally synced models
         if client.check_finished():
             # finish the models by defining the leaves
+            print(f"Model finished after {counter} iterations")
+            print(f"Setting the final leaf nodes")
             leaf_samples = client.get_leaf_node_samples()
                 # splits x n_estimators x n_leaf_nodes x Dict[class_i] = frequency
             protocol_fed_learning.send_data_to_coordinator(leaf_samples)
@@ -128,10 +133,10 @@ def main(protocol_fed_learning: ProtocolFedLearning,
                 gathered_leaf_samples: List[List[List[List[List[int]]]]] = protocol_fed_learning.gather_data()
                     # clients x splits x n_estimators x n_leaf_nodes x
                     # List[idx: global_class_idx, val: frequency]
-                global_leaf_samples = client.coord_aggregate_leaf_samples(gathered_leaf_samples)
-                protocol_fed_learning.broadcast_data(global_leaf_samples)
+                global_leaf_samples_to_broadcast = client.coord_aggregate_leaf_samples(gathered_leaf_samples)
+                protocol_fed_learning.broadcast_data(global_leaf_samples_to_broadcast)
             # update the models with the leaf nodes
-            global_leaf_samples: List[List[List[int]]] = protocol_fed_learning.await_data()
+            global_leaf_samples: List[List[np.ndarray]] = protocol_fed_learning.await_data()
             client.set_final_leaf_nodes(global_leaf_samples)
             break
 
