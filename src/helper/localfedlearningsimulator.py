@@ -2,7 +2,10 @@
 A class to use to simulate a federated learning environment locally. This class
 adheres to the ProtocolFedLearning protocol of this project. This class represents
 a single client in a federated learning environment.
-#TODO: describe the classes
+- SharedDictionary: A helper class that allows multiple instances to share a single dictionary concurrently.
+- LocalFedLearningSimulator: The simulator class, representing a single client in a federated learning environment.
+- LocalFedLearningSimulationWrapper: A wrapper class to simulate a federated learning environment locally. Contains
+    multiple instances of LocalFedLearningSimulator and prepares the folder for running them.
 """
 from threading import Lock
 import os
@@ -11,7 +14,7 @@ import shutil
 from typing import Any, Optional, List
 from .protocolfedlearningclass import ProtocolFedLearning
 
-WAITING_TIME = 0.3
+WAITING_TIME = 0.1
 
 class SharedDictionary:
     """
@@ -235,6 +238,7 @@ class LocalFedLearningSimulationWrapper:
         # basic variables
         self.num_clients = len(clientfolders)
         self.shared_dict = SharedDictionary(num_clients=self.num_clients)
+        self.created_files = []
 
         # copy files from the generic folder to each client folder
         for clientfolder in clientfolders:
@@ -243,8 +247,19 @@ class LocalFedLearningSimulationWrapper:
                 for file in files:
                     src_file = os.path.join(root, file)
                     dst_file = os.path.join(clientfolder, file)
-                    if not os.path.exists(dst_file):
+                    if os.path.exists(dst_file):
+                        if os.path.getmtime(src_file) > os.path.getmtime(dst_file):
+                            print("WARNING: File from generic folder already exists in client " +\
+                                "but generic file is newer. Overwriting")
+                            shutil.copy(src_file, dst_file)
+                            self.created_files.append(dst_file)
+                        else:
+                            print("WARNING: File from generic folder already exists in client " +\
+                                  "and is newer. Skipping copy of the file from generic folder")
+                    else:
+                        # file doesn't exist yet, copy it
                         shutil.copy(src_file, dst_file)
+                        self.created_files.append(dst_file)
 
         # create the client instances
         self.clients: List[LocalFedLearningSimulator] = []
@@ -257,3 +272,12 @@ class LocalFedLearningSimulationWrapper:
                                                outputfolder=outputfolders[i],
                                                shared_dict=self.shared_dict)
             self.clients.append(client)
+
+    def cleanup_created_files(self):
+        """
+        Removes any files that were added to client folders during the init process
+        from the generic folder.
+        """
+        for file in self.created_files:
+            os.remove(file)
+        self.created_files = []

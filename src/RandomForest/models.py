@@ -3,7 +3,6 @@ from typing import Optional, Union, Dict, Any, List, Iterator, Tuple, Generator
 import numpy as np
 import joblib
 # pylint: disable=too-many-instance-attributes, invalid-name
-import inspect
 
 class RandomForest:
     """
@@ -29,7 +28,6 @@ class RandomForest:
                  X_hist: np.ndarray,
                  y: np.ndarray,
                  num_bins: int,
-                 min_impurity_decrease: float = 0.0
                 ) -> None:
         """
         The random forest model for federated learning. Sets the following parameters at initialization
@@ -53,7 +51,6 @@ class RandomForest:
                     ]min, val1, ..., max[
                     A bin_idx of 0 would mean a threshold of <= split_points[0] -> left child,
                     A bin_idx of len(split_points-1) would mean a threshold of <= split_points[-1] -> left child
-                    #TODO: double check the indexing here, this is key
             prediction_mode: 'classification' or 'regression'
             global_classes: global classes. Should be the same in the same order for all clients
             oob: whether to use out-of-bag # TODO: finnish this description, should be used in the evaluation?
@@ -63,15 +60,10 @@ class RandomForest:
                 The values are NOT the actual values but the bin indices the samples belong to
                 This is used in the training process to calculate the split scores
                 When the training is done, the data is removed
-                #TODO: ensure it is removed!!!
-                #TODO: use this
             y: target data, 1d array of shape (n_samples), indicating the target value
                 This is used in the training process to calculate the split scores
                 When the training is done, the data is removed
             n_bins: number of bins to consider for each feature.
-            min_impurity_decrease: if a nodes impurity in comparison to the parent is smaller than this
-                value, the node is not split further and becomes a leaf node
-                Default is 0 aka it just needs to be better than the parent
         """
         # private vars
         self.__max_samples = max_samples
@@ -94,7 +86,6 @@ class RandomForest:
         self.__num_bins = num_bins
         if num_bins-1 != split_points.shape[1]:
             raise ValueError('Number of bins must match number of split points.')
-        self.min_impurity_decrease = min_impurity_decrease
         self.finished = False
 
         # public vars
@@ -227,10 +218,7 @@ class RandomForest:
         predicted_values:np.ndarray = np.argmax(sum_predicted_classes, axis=1)
             # we go from n_samples x n_classes to n_samples by taking the index of the highest value
         # now we translate from class_idx to the actual class
-        print(f"Global classes: {self.__global_classes}") #TODO: rmv
-        print("predicted values as idx: ", predicted_values) #TODO: rmv
         predicted_values = np.vectorize(lambda x: self.__global_classes[x])(predicted_values)
-        print("predicted values as class: ", predicted_values) #TODO: rmv
         return predicted_values
 
 
@@ -328,6 +316,7 @@ class RandomForest:
                 Contains for each estimator and node a tuple of (feature_idx, bin_idx, score)
                 describing the globally best split. If any entry in the n_estimators dimension is None,
                 the corresponding tree is considered finished and there is no update for this tree.
+                Careful, the feature_idx is the index in the node's feature_idcs list!
             global_leaf_info: 2d list of dimensions (n_estimators, num_leaf_nodes),
                 Contains for each estimator the indexes of the leaf nodes.
                 Can be None if the tree is finished.
@@ -335,12 +324,6 @@ class RandomForest:
         if self.__X_hist is None or self.__y is None or self.__split_points is None:
             raise ValueError('No data to set the nodes. Is the model finished?')
         for tree_idx, tree in enumerate(self.__decision_trees):
-            # TODO: rmv
-            # print(f"Setting tree {tree_idx}")
-            # print(f"Global best split: {global_best_split[tree_idx]}")
-            # print(f"Global leaf info: {global_leaf_info[tree_idx]}")
-            # print(f"shape global best split: {np.array(global_best_split).shape}")
-            # print(f"shape global leaf info: {np.array(global_leaf_info).shape}")
             if global_best_split[tree_idx] is None or global_leaf_info[tree_idx] is None:
                 if not tree.finished:
                     raise ValueError('Global model assumes finished tree, local model does not.')
@@ -363,10 +346,13 @@ class RandomForest:
                 if node_idx >= len(global_best_split[tree_idx]): #type: ignore
                     raise ValueError('Global model assumes more nodes than local model.')
                 feature_idx, bin_idx, score = global_best_split[tree_idx][node_idx] #type: ignore
+                # CAREFUL, we need to use the feature index in the node's feature_idcs list!
+                # we can simply use the trees feature_idcs as all nodes of a tree have the same
+                # feature_idcs list
                 left_child, right_child = node.set_node(
-                    feature_idx=feature_idx,
+                    feature_idx=self.__feat_idcs[tree_idx][feature_idx],
                     bin_idx=bin_idx,
-                    threshold=self.__split_points[feature_idx, bin_idx],
+                    threshold=self.__split_points[self.__feat_idcs[tree_idx][feature_idx], bin_idx],
                     score=score,
                     X_hist=self.__X_hist
                 )
@@ -402,10 +388,27 @@ class RandomForest:
 
     def get_hyperparameters_used(self):
         """
-        Returns the hyperparameters used in training this model.
-        #TODO: finnish this
+        Returns the hyperparameters used in training this model. Check the function to see which
+        hyperparameters are returned.
         """
-        raise NotImplementedError('Not yet implemented.')
+        return {
+            'n_estimators': self.n_estimators,
+            'max_samples': self.__max_samples,
+            'feat_idcs': self.__feat_idcs,
+            'max_depth': self.__max_depth,
+            'min_samples_split': self.__min_samples_split,
+            'bootstrap': self.__bootstrap,
+            'random_state': self.__random_state,
+            'quantile': self.__quantile,
+            'global_mean': self.__global_mean,
+            'global_stddev': self.__global_stddev,
+            'split_points': self.__split_points,
+            'prediction_mode': self.prediction_mode,
+            'global_classes': self.__global_classes,
+            'oob': self.__oob,
+            'class_weights': self.__class_weights,
+            'num_bins': self.__num_bins
+        }
 
     def cleanup_model(self):
         """
@@ -529,14 +532,17 @@ class DecisionTree:
         if len(self.__cur_depth_nodes) == 0 or self.finished:
             # this method should only be called if there are nodes to calculate the split for
             raise ValueError('No nodes to calculate the split for, the tree is finished.')
-        for node in self.__cur_depth_nodes:
+        for node_idx, node in enumerate(self.__cur_depth_nodes):
             # IMPORTANT: we actively don't check if the node is finished, as the nodes in
             # the current depth are required to not be set yet!
             # this is why we throw an error if the node is already set
             # we later should only add the children of non leaf nodes to
             # current_depth_nodes, this is why if we here then find a set node, we should
             # throw an error
-            node_scores, node_counts, node_only_class = node.get_split_scores(X_hist, y, n_bins)
+            node_scores, node_counts, node_only_class = node.get_split_scores(
+                X_hist,
+                y,
+                n_bins)
             scores.append(node_scores)
             counts.append(node_counts)
             only_classes.append(node_only_class)
@@ -602,7 +608,6 @@ class DecisionTree:
         Returns:
             Tuple[int, int]: the amount of incorrect samples and the total amount of oob samples
         """
-        # TODO
         # 1. get the oob samples
         # 2. predict the oob samples
         # 3. return the amount of incorrect samples and the total oob samples
@@ -754,7 +759,7 @@ class Node:
             raise ValueError('Mode must be either classification or regression.')
         self.mode = mode
         for cl in global_classes:
-            if cl not in class_weights:
+            if class_weights and cl not in class_weights:
                 raise ValueError('Class weights must be given for all classes or not at all')
         self.class_weights = class_weights
 
@@ -769,7 +774,8 @@ class Node:
         Then creates the left and right child nodes and returns them.
 
         Args:
-            feature_idx: the feature index to use in this node
+            feature_idx: the feature_idx to use in this node. This is the index of all data, not
+                of this nodes subset of features!
             bin_idx: the bin index to use in this node
             threshold: the threshold value at which to split the data
                 threshold is used with the actual data, bin_idx with the histogram data
@@ -789,6 +795,8 @@ class Node:
             raise ValueError('Trying to set a node that is set already.')
         if self.global_leaf:
             raise ValueError('Trying to set a leaf node.')
+        if self.__sample_idcs is None:
+            raise ValueError('Node has no sample indices. Cannot set a split.')
 
         # set the node
         self.feature_idx = feature_idx
@@ -799,6 +807,10 @@ class Node:
         relevant_data = X_hist[self.__sample_idcs, feature_idx]
         # create the left and right child nodes
         left_child_idcs, right_child_idcs = self.perform_hist_based_split(relevant_data, bin_idx)
+        # Careful, these indices are the indices in the sample_idcs list of the parent node
+        # we need to translate them back to the sample_idcs
+        left_child_idcs = self.__sample_idcs[left_child_idcs]
+        right_child_idcs = self.__sample_idcs[right_child_idcs]
         left_child = Node(depth=self.depth + 1,
                             sample_idcs=left_child_idcs,
                             mode=self.mode,
@@ -903,7 +915,8 @@ class Node:
             raise ValueError('X_hist and y must have the same number of samples.')
         if len(y.shape) != 1:
             raise ValueError('y must be a 1d array.')
-        node_data = X_hist[self.__sample_idcs]
+        node_data = X_hist[self.__sample_idcs, :]
+        node_y = y[self.__sample_idcs]
         scores = []
             # num_features x num_bins
         counts = []
@@ -916,8 +929,8 @@ class Node:
                 # since we check for <= bin_idx -> left, for the last bin_idx, left would always
                 # contain all data, so we don't need to check it
                 left_idxs, right_idxs = self.perform_hist_based_split(feature_data, bin_idx)
-                left_y = y[left_idxs]
-                right_y = y[right_idxs]
+                left_y = node_y[left_idxs]
+                right_y = node_y[right_idxs]
                 if self.mode == 'classification':
                     # Each node is a binary split, we just check that the impurity is minimized
                     score = self._gini_split_score(left_y, right_y)
@@ -987,6 +1000,10 @@ class Node:
             gini = sum_weight_of_samples_left / sum_weight_of_samples * gini_left +
                 sum_weight_of_samples_right / sum_weight_of_samples * gini_right
 
+        In case of a perfect split, the gini impurity is 0, so the gini score is 0
+        (1-1 for one class other classes are all 0). In the worst case, the gini impurity goes
+        towards 1.
+
         Args:
             left_y: target values of the samples that would end up in the left node
             right_y: target values of the samples that would end up in the right node
@@ -1017,7 +1034,7 @@ class Node:
         if total_left == 0 or total_right == 0:
             # this means that our 'split' does not split at all
             # numpy just creates a nan tho
-            # we won't to disencourage such splits, they don't have any information gain
+            # we want to disencourage such splits, they don't have any information gain
             # we simply set the gini score to the worst possible score (1)
             return np.float64(1.0)
 

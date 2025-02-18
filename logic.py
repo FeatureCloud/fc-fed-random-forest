@@ -93,11 +93,8 @@ def main(protocol_fed_learning: ProtocolFedLearning,
     counter = 0
     while True:
         counter += 1
-
         # local scores
         local_scores, local_counts, only_class = client.get_current_level_splitscores()
-            # TODO: explain this a bit
-            # TODO: ensure the global_split_data really contains None for finished trees
         protocol_fed_learning.send_data_to_coordinator([local_scores, local_counts, only_class], memo=f"local_scores_{counter}")
 
         # local scores -> global scores
@@ -108,7 +105,6 @@ def main(protocol_fed_learning: ProtocolFedLearning,
                                                 sample_count_per_client=\
                                                     [result[i][1] for i in range(len(result))],
                                                 only_class_per_client=[result[i][2] for i in range(len(result))])
-
             protocol_fed_learning.broadcast_data((global_split_scores, global_leaf_info))
 
         global_split_scores, global_leaf_info = protocol_fed_learning.await_data()

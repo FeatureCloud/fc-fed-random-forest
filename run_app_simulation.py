@@ -81,4 +81,8 @@ def run_simulation_native(clientpaths: List[str], outputfolders: List[str], gene
             target=main,
             args=(local_client, clientpaths[idx], outputfolders[idx])))
         threads[-1].start()
-    # done
+
+    # done, perform cleanup
+    for thread in threads:
+        thread.join()
+    wrapper.cleanup_created_files()

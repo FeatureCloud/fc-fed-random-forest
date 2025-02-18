@@ -1,7 +1,6 @@
 """
 Contains the client class for the federated learning of a Randomforest using histograms.
-Usage:
-    TODO: write in which order the methods should be called by whom
+To see the usage, check the logic module
 """
 # pylint: disable=invalid-name, too-many-instance-attributes, too-many-arguments
 # pylint: disable=too-many-locals, too-many-branches, too-many-statements
@@ -25,16 +24,12 @@ class FedHistRandomForestClient():
     This class is used for all clientside computations in the learning of a
     federated Randomforest using histograms.
     It is meant to be used in conjuction with the coordinator class.
-    #TODO: Add more information on how to use this class
     """
     def __init__(self,
                  config: Optional[dict] = None,
                  inputfolder: str = "mnt/input",
                  outputfolder: str = "mnt/output",
                  logging_class: Optional[logging.Logger] = None) -> None:
-        """
-        #TODO: Add docstring
-        """
         # Read in all configuration parameters
         self.inputfolder = inputfolder
         self.outputfolder = outputfolder
@@ -1104,7 +1099,7 @@ class FedHistRandomForestClient():
             leaf_status: List[List[int]]
                 (splits x n_estimators x n_leaf_nodes):
                 Contains the indexes in current_depth_nodes that have been determined to be
-                leaf nodes.
+                local leaf nodes.
         """
         if self.rf_models is None:
             raise ValueError('The forest has not been initialized yet')
@@ -1121,6 +1116,7 @@ class FedHistRandomForestClient():
                 leaf_status_per_node = []
                 node_scores = []
                 if tree.finished:
+                    self.logging_class.info(f'Tree {tree_idx} is already finished. Skipping it...')
                     # ensure that no client sent any data for this tree
                     if any([specific_client_split_score[split_idx][tree_idx] is not None \
                             for specific_client_split_score in client_split_scores]):
@@ -1140,15 +1136,14 @@ class FedHistRandomForestClient():
                             for specific_client_only_class in only_class_per_client]):
                     raise ValueError(f'Not all clients sent only class info for the tree {tree_idx}. Some clients consider the tree done, others dont')
                 for node_idx, _ in enumerate(tree.iterate_cur_depth_nodes()):
-                    split_scores = [d[split_idx][tree_idx][node_idx] for d in client_split_scores] #type: ignore
-                        # clients x features x n_bins
-                    sample_counts = [c[split_idx][tree_idx][node_idx] for c  in sample_count_per_client] #type: ignore
+                    sample_counts = [np.array(c[split_idx][tree_idx][node_idx]) for c  in sample_count_per_client] #type: ignore
                         # clients x features
                     total_counts = np.sum(sample_counts, axis=0)
                         # vector of length features of the total number of samples over all clients
                         # per feature of this specific node
-
-                    ratios = np.divide(sample_counts, total_counts)
+                    split_scores = [np.array(d[split_idx][tree_idx][node_idx]) for d in client_split_scores] #type: ignore
+                        # clients x features x n_bins
+                    ratios = np.divide(sample_counts, total_counts, where=total_counts != 0, out=np.full_like(sample_counts, np.nan, dtype=float))
                         # this is the weight to use for the relevant client
                         # dividing clients x features by features -> ratio for each client and feature
                         # (clients x features dimensions)
@@ -1157,11 +1152,11 @@ class FedHistRandomForestClient():
                         # we multiply the split scores with the ratios of the relevant client
                         # then we can sum over the clients axis
                         # this results in the end in a features x n_bins matrix
-                    if sum_split_score.shape != (self.max_features, self.n_bins-1):
-                        self.logging_class.error(f"Split scores of all clients for this node: {split_scores}")
-                        self.logging_class.error(f"Split scores sum: {sum_split_score}")
-                        self.logging_class.error(f'Split score shape is {sum_split_score.shape} but should be {(self.max_features, self.n_bins)}')
-                        raise ValueError('Split score shape is not correct')
+                    # if sum_split_score.shape != (self.max_features, self.n_bins-1):
+                    #     self.logging_class.error(f"Split scores of all clients for this node: {split_scores}")
+                    #     self.logging_class.error(f"Split scores sum: {sum_split_score}")
+                    #     self.logging_class.error(f'Split score shape is {sum_split_score.shape} but should be {(self.max_features, self.n_bins)}')
+                    #     raise ValueError('Split score shape is not correct')
                     feature_idx, bin_idx = np.unravel_index(np.argmin(sum_split_score), sum_split_score.shape)
                         # we find the feature and bin index with the lowest score over all features and bins
                         # np.argmin returns the index of the flattened array, we need to unravel it
@@ -1169,6 +1164,8 @@ class FedHistRandomForestClient():
                     min_score = np.min(sum_split_score)
                     node_scores.append((feature_idx, bin_idx, min_score))
 
+                    # total_counts can reach 0 for all features resulting in a 0 division, resulting
+                    # in a min_score of nan
                     ## leaf node checks
                     # now we need to decide whether this node is a leaf node
                     # only one class
@@ -1191,6 +1188,11 @@ class FedHistRandomForestClient():
                     if total_counts[feature_idx] < self.rf_models[split_idx].get_min_samples_split():
                         leaf_status_per_node.append(node_idx)
                         continue
+
+                    # score is nan
+                    if np.isnan(min_score):
+                        leaf_status_per_node.append(node_idx)
+                        continue
                     # min_samples_leaf reached
                     # TODO: implement this at some point. Check this node as if it were a leaf
                     # if it has too little samples, the parent must be turned into a leaf and the
@@ -1198,14 +1200,6 @@ class FedHistRandomForestClient():
                     # probably needs a new structure of what is returned here, e.g. not only the
                     # index of leaves but per index the information if the leaf_status is this
                     # node or the parent node
-                    # min_impurity_decrease
-                    # get the parents score
-                    if node.parent:
-                        # only works for non root nodes
-                        parent_score = node.parent.score
-                        if parent_score - min_score < self.rf_models[split_idx].min_impurity_decrease:
-                            leaf_status_per_node.append(node_idx)
-                            continue
 
                 tree_scores.append(node_scores)
                 leaf_status_per_tree.append(leaf_status_per_node)
@@ -1272,7 +1266,6 @@ class FedHistRandomForestClient():
             List[List[float]] (splits x trees):
                 The weight of each tree in the random forest of each split.
         """
-        #TODO: implement the aggregation of the oob errors
         # collapse the client axis
         gathered_oob_errors_np = np.array(gathered_oob_errors)
         gathered_oob_errors_np = np.sum(gathered_oob_errors_np, axis=0)
@@ -1338,7 +1331,10 @@ class FedHistRandomForestClient():
             self.n_estimators: int = int(config.get('n_estimators', 100))
             self.criterion: str = config.get('criterion', 'gini')
             self.max_depth: int = int(config.get('max_depth', 10))
-            self.min_samples_split: int = config.get('min_samples_split', 2)
+            self.min_samples_split: int = config.get('min_samples_split', 5)
+            min_samples_leaf: int = config.get('min_samples_leaf', 0)
+            if min_samples_leaf != 0:
+                self.logging_class.warning('min_samples_leaf is not supported')
             self.__max_features_raw: Union[str, float, int] = config.get('max_features', 'sqrt')
             self.bootstrap: bool = config.get('bootstrap', True)
             self.max_samples_raw: Union[None, float, int] = config.get('max_samples', None)

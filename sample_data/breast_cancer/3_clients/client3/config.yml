@@ -13,13 +13,12 @@ fc-rand-forest:
     dir: .
   n_estimators: 100
   max_depth: 10
-  min_samples_split: 2
-  min_samples_leaf: 1
+  min_samples_split: 10
   max_features: 'sqrt'
   max_samples: 0.75
   bootstrap: True
   random_state: 42
   mode: 'classification'
-  n_bins: 10
+  n_bins: 25
   use_weighted_classes: True
   output_mode: 'model+pred'
