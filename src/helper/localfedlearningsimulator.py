@@ -219,7 +219,7 @@ class LocalFedLearningSimulationWrapper:
     def __init__(self,
                  clientfolders: List[str],
                  outputfolders: List[str],
-                 generic_dir: str) -> None:
+                 generic_dir: Optional[str]) -> None:
         """
         The following arguments are required:
 
@@ -243,23 +243,24 @@ class LocalFedLearningSimulationWrapper:
         # copy files from the generic folder to each client folder
         for clientfolder in clientfolders:
             # copy files from the generic folder to the client folder
-            for root, _, files in os.walk(generic_dir):
-                for file in files:
-                    src_file = os.path.join(root, file)
-                    dst_file = os.path.join(clientfolder, file)
-                    if os.path.exists(dst_file):
-                        if os.path.getmtime(src_file) > os.path.getmtime(dst_file):
-                            print("WARNING: File from generic folder already exists in client " +\
-                                "but generic file is newer. Overwriting")
+            if generic_dir is not None:
+                for root, _, files in os.walk(generic_dir):
+                    for file in files:
+                        src_file = os.path.join(root, file)
+                        dst_file = os.path.join(clientfolder, file)
+                        if os.path.exists(dst_file):
+                            if os.path.getmtime(src_file) > os.path.getmtime(dst_file):
+                                print("WARNING: File from generic folder already exists in client " +\
+                                    "but generic file is newer. Overwriting")
+                                shutil.copy(src_file, dst_file)
+                                self.created_files.append(dst_file)
+                            else:
+                                print("WARNING: File from generic folder already exists in client " +\
+                                    "and is newer. Skipping copy of the file from generic folder")
+                        else:
+                            # file doesn't exist yet, copy it
                             shutil.copy(src_file, dst_file)
                             self.created_files.append(dst_file)
-                        else:
-                            print("WARNING: File from generic folder already exists in client " +\
-                                  "and is newer. Skipping copy of the file from generic folder")
-                    else:
-                        # file doesn't exist yet, copy it
-                        shutil.copy(src_file, dst_file)
-                        self.created_files.append(dst_file)
 
         # create the client instances
         self.clients: List[LocalFedLearningSimulator] = []
